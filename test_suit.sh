@@ -62,7 +62,7 @@ generate_file() {
             printf "%d:%05dITEM-%04d|CAT=%s|AMT=%08.2f|FLAG=%s\n" \
                 "$i" "$i" "$((i-1))" "$cat_char" "$(awk "BEGIN{printf \"%.2f\", ($i*3.14159)%10000}")" "$flag_char"
         done
-        printf "9END%08d\n" "$lines"
+        printf "FOOTERTEST%08d\n" "$lines"
     } > "$FILE"
 }
 
@@ -80,7 +80,7 @@ test_file_generation() {
     [[ "$header" == "1-HEADER-RECORD|DATE=2026-01-18|SRC=UNITTEST" ]] && \
         ok "header is correct" || fail "header is correct"
     
-    footer "$FILE" | grep -qE '^9END[0-9]{8}$' && \
+    footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$' && \
         ok "footer format is valid" || fail "footer format is valid"
 }
 
@@ -100,7 +100,7 @@ test_line_delete() {
     run_cmd "-f $FILE -l 500 --yes --no-color" </dev/null >/dev/null
     
     assert "deletes exactly one line" test "$(count_lines "$FILE")" -eq $((before - 1))
-    assert "footer decremented correctly" test "$(footer "$FILE")" = "9END00000999"
+    assert "footer decremented correctly" test "$(footer "$FILE")" = "FOOTERTEST00000999"
     assert "correct line was deleted" has_no_line "ITEM-0499" "$FILE"
 }
 
@@ -134,7 +134,7 @@ test_keyword_delete() {
     local after=$(count_lines "$FILE")
     
     assert "-w deletes multiple matching lines" test "$after" -lt "$before"
-    footer "$FILE" | grep -qE '^9END[0-9]{8}$' && \
+    footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$' && \
         ok "footer valid after bulk delete" || fail "footer valid after bulk delete"
 }
 
@@ -212,7 +212,7 @@ test_footer_integrity() {
         run_cmd "-f $FILE -l $((100 + i*10)) --yes --no-color" </dev/null >/dev/null
     done
     
-    local footer_num=$(footer "$FILE" | sed 's/9END//' | sed 's/^0*//')
+    local footer_num=$(footer "$FILE" | sed 's/FOOTERTEST//' | sed 's/^0*//')
     assert "footer accurate after multiple deletes" test "$footer_num" = "995"
 }
 
@@ -254,7 +254,7 @@ test_regex_delete() {
     local after=$(count_lines "$FILE")
     
     assert "regex delete reduces line count" test "$after" -lt "$before"
-    footer "$FILE" | grep -qE '^9END[0-9]{8}$' && \
+    footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$' && \
         ok "footer updated after regex delete" || fail "footer updated after regex delete"
 }
 
