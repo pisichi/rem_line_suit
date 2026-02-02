@@ -2,11 +2,10 @@
 set -euo pipefail
 
 # ================= COLORS =================
-RED=$(printf '\033[31;1m')
-YELLOW=$(printf '\033[33;1m')
-GREEN=$(printf '\033[32;1m')
-RESET=$(printf '\033[0m')
-NO_COLOR=0
+RED='\033[31;1m'
+YELLOW='\033[33;1m'
+GREEN='\033[32;1m'
+RESET='\033[0m'
 
 # ================= CONFIGURATION =================
 PREVIEW_LIMIT=10
@@ -14,14 +13,23 @@ REGEX_MODE=0
 FORCE_MODE=0
 YES_MODE=0
 DRY_RUN=0
-BACKUP_DIR="backup"
+NO_COLOR=0
 DEFAULT_FILE="./data.txt"
-TEMP_DIR=""  # Empty = use file's directory
+
+# Search/Replace settings
 POS_START=""
 POS_END=""
-_tmpfiles=()
+REPLACE_MODE=0
+REPLACE_POS=""
+REPLACE_TXT=""
 
-# ================= HEADER/FOOTER CONFIG =================
+# File settings
+FILE=""
+LINE_NUM=""
+WORD=""
+ROLLBACK=0
+
+# Header/Footer
 HEADER_LINE_NUM=1
 FOOTER_PATTERN="^FOOTERTEST[0-9]+$"
 FOOTER_PREFIX="FOOTERTEST"
@@ -29,335 +37,379 @@ FOOTER_NUM_FORMAT="%08d"
 
 export LC_ALL=C
 
-# ================= CLEANUP & TRAP =================
-cleanup() {
-    local f
-    for f in "${_tmpfiles[@]}"; do
-        [[ -f "$f" ]] && rm -f "$f"
-    done
-}
-trap cleanup EXIT
+# ================= UTILITIES =================
+err() { echo "Error: $*" >&2; exit 1; }
 
-# ================= UTILITY FUNCTIONS =================
-err() { 
-    echo "Error: $*" >&2
-    exit 1
+info() {
+    (( NO_COLOR )) && echo "$*" || echo -e "${GREEN}$*${RESET}"
 }
 
-info() { 
-    if [[ $NO_COLOR -eq 1 ]]; then
-        echo "$*"
-    else
-        echo -e "${GREEN}$*${RESET}"
-    fi
-}
-
-warn() { 
-    if [[ $NO_COLOR -eq 1 ]]; then
-        echo "$*"
-    else
-        echo -e "${YELLOW}$*${RESET}"
-    fi
-}
-
-require_file() {
-    [[ -f "$1" ]] || err "File not found: $1"
-}
-
-require_readable() {
-    [[ -r "$1" ]] || err "File not readable: $1"
-}
-
-require_writable() {
-    [[ -w "$1" ]] || err "File not writable: $1"
+warn() {
+    (( NO_COLOR )) && echo "$*" || echo -e "${YELLOW}$*${RESET}"
 }
 
 confirm() {
     (( YES_MODE )) && return 0
-    local ans
     read -r -p "$1 (y/n): " ans
     [[ "$ans" =~ ^[yY]$ ]]
 }
 
-# ================= TEMP DIRECTORY SETUP =================
-init_temp_dir() {
+# ================= BACKUP MANAGEMENT =================
+get_backup_name() {
     local file="$1"
-    
-    if [[ -z "$TEMP_DIR" ]]; then
-        TEMP_DIR="$(dirname "$(cd "$(dirname "$file")" && pwd -P)/$(basename "$file")")"
-    fi
-    
-    if [[ ! -d "$TEMP_DIR" ]]; then
-        mkdir -p "$TEMP_DIR" || err "Cannot create temp directory: $TEMP_DIR"
-    fi
-    
-    if [[ ! -w "$TEMP_DIR" ]]; then
-        err "Temp directory not writable: $TEMP_DIR"
-    fi
+    echo "${file}_backup"
 }
 
-create_temp_file() {
-    local tmpfile
-    tmpfile=$(mktemp -p "$TEMP_DIR" "line_delete.XXXXXX") || err "Cannot create temp file in $TEMP_DIR"
-    echo "$tmpfile"
+create_backup() {
+    local file="$1"
+    local backup
+    backup=$(get_backup_name "$file")
+    
+    # Only create if doesn't exist
+    if [[ -f "$backup" ]]; then
+        info "Using existing backup: $backup"
+    else
+        (( DRY_RUN )) || cp -p "$file" "$backup" || err "Failed to create backup"
+        info "Created backup: $backup"
+    fi
+    echo "$backup"
 }
 
-# ================= BACKUP =================
-backup_file() {
-    local src="$1"
-    mkdir -p "$BACKUP_DIR" || err "Cannot create backup directory"
-    local out="$BACKUP_DIR/$(basename "$src")_$(date +%Y%m%d%H%M%S)"
-    (( DRY_RUN )) && { echo "$out"; return; }
-    cp -p "$src" "$out" || err "Backup failed: $out"
-    echo "$out"
+rollback_file() {
+    local file="$1"
+    local backup
+    backup=$(get_backup_name "$file")
+    
+    [[ -f "$backup" ]] || err "Backup file not found: $backup"
+    
+    info "Current file lines: $(wc -l < "$file")"
+    info "Backup file lines: $(wc -l < "$backup")"
+    
+    (( DRY_RUN )) && { info "[DRY-RUN] Would restore from: $backup"; return; }
+    
+    confirm "Restore from backup?" || return
+    
+    cp -p "$backup" "$file" || err "Rollback failed"
+    info "Restored from backup: $backup"
 }
 
 # ================= FOOTER OPERATIONS =================
-compute_new_footer() {
+compute_footer() {
     local file="$1" deleted="$2"
-    local raw clean num new
+    local footer num new
     
-    raw=$(tail -n 1 "$file") || err "Cannot read footer"
-    clean=$(echo "$raw" | tr -d '[:space:]')
+    footer=$(tail -n 1 "$file" | tr -d '[:space:]')
+    [[ "$footer" =~ $FOOTER_PATTERN ]] || err "Invalid footer: $footer"
     
-    if ! [[ "$clean" =~ $FOOTER_PATTERN ]]; then
-        err "Invalid footer format: $raw (expected pattern: $FOOTER_PATTERN)"
-    fi
-    
-    num=${clean#$FOOTER_PREFIX}
+    num=${footer#$FOOTER_PREFIX}
     new=$((10#$num - deleted))
-    
-    (( new < 0 )) && err "Footer would become negative: $num - $deleted = $new"
+    (( new < 0 )) && err "Footer would be negative: $num - $deleted = $new"
     
     printf "${FOOTER_PREFIX}${FOOTER_NUM_FORMAT}" "$new"
 }
 
 get_footer() {
-    (( FORCE_MODE || YES_MODE )) && { compute_new_footer "$@"; return; }
-    confirm "Recalculate footer?" && compute_new_footer "$@" || tail -n 1 "$1"
+    (( FORCE_MODE || YES_MODE )) && { compute_footer "$@"; return; }
+    confirm "Recalculate footer?" && compute_footer "$@" || tail -n 1 "$1"
 }
 
-# ================= FILE OPERATIONS =================
-get_total_lines() {
-    wc -l < "$1" || err "Cannot read file: $1"
-}
-
-# ================= PREVIEW LINE =================
+# ================= PREVIEW FUNCTIONS =================
 preview_line() {
-    local file="$1" line="$2"
-    local total
+    local file="$1" line="$2" total
+    total=$(wc -l < "$file")
     
-    total=$(get_total_lines "$file")
+    (( line < 1 || line > total )) && err "Line $line out of range (1-$total)"
     
-    if (( line < 1 || line > total )); then
-        err "Line $line out of range (1-$total)"
-    fi
+    local start=$((line > 1 ? line - 1 : 1))
+    local end=$((line < total ? line + 1 : total))
     
-    local start=$((line < 2 ? 1 : line - 1))
-    local end=$((line > total - 1 ? total : line + 1))
-    
-    echo "Lines to be deleted (preview):"
+    echo "Preview:"
     awk -v s="$start" -v t="$line" -v e="$end" \
-        -v R="$RED" -v Y="$YELLOW" -v X="$RESET" '
-        NR>=s && NR<=e {
-            if (NR==t) printf "%s%5d | %s%s\n", R, NR, $0, X
-            else        printf "%s%5d | %s%s\n", Y, NR, $0, X
+        -v R="$RED" -v Y="$YELLOW" -v X="$RESET" \
+        -v nc="$NO_COLOR" '
+        NR >= s && NR <= e {
+            prefix = (nc ? "" : (NR == t ? R : Y))
+            suffix = (nc ? "" : X)
+            printf "%s%5d | %s%s\n", prefix, NR, $0, suffix
         }' "$file"
 }
 
-# ================= PREVIEW MATCHES =================
 preview_matches() {
     local file="$1" word="$2"
     
-    echo "Matches (showing up to $PREVIEW_LIMIT):"
-    
+    echo "Matches (up to $PREVIEW_LIMIT):"
     awk -v w="$word" -v limit="$PREVIEW_LIMIT" \
-        -v s="$POS_START" -v e="$POS_END" \
-        -v regex="$REGEX_MODE" \
-        -v R="$RED" -v X="$RESET" '
+        -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
+        -v R="$RED" -v X="$RESET" -v nc="$NO_COLOR" '
         BEGIN { shown=0 }
         {
-            seg = (s && e) ? substr($0, s, e-s+1) : $0
-            if (regex) {
-                match_result = match(seg, w)
-            } else {
-                match_result = index(seg, w)
-            }
-            if (match_result) {
+            seg = (s && e) ? substr($0, s, e - s + 1) : $0
+            matched = regex ? match(seg, w) : index(seg, w)
+            
+            if (matched) {
                 shown++
                 if (shown <= limit) {
-                    line = $0
-                    if (regex) {
-                        gsub(w, R "&" X, line)
+                    if (nc) {
+                        printf "%d:%s\n", NR, $0
                     } else {
-                        gsub(w, R w X, line)
+                        line = $0
+                        if (regex) {
+                            gsub(w, R "&" X, line)
+                        } else {
+                            gsub(w, R w X, line)
+                        }
+                        printf "%d:%s\n", NR, line
                     }
-                    printf "%d:%s\n", NR, line
                 }
             }
         }
-        END { if (shown > limit) print "... +" (shown-limit) " more matches" }' "$file"
+        END { 
+            if (shown > limit) print "... +" (shown - limit) " more"
+            if (shown == 0) print "No matches found"
+            exit (shown == 0 ? 1 : 0)
+        }' "$file"
 }
 
-# ================= WRITE REMOVED FILE =================
-write_removed_file() {
+preview_replacements() {
+    local file="$1" word="$2" rs="$3" re="$4" rtxt="$5"
+    
+    echo "Replacement preview (up to $PREVIEW_LIMIT):"
+    awk -v w="$word" -v limit="$PREVIEW_LIMIT" \
+        -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
+        -v rs="$rs" -v re="$re" -v rtxt="$rtxt" \
+        -v R="$RED" -v G="$GREEN" -v Y="$YELLOW" -v X="$RESET" -v nc="$NO_COLOR" '
+        BEGIN { shown=0 }
+        {
+            seg = (s && e) ? substr($0, s, e - s + 1) : $0
+            matched = regex ? match(seg, w) : index(seg, w)
+            
+            if (matched) {
+                shown++
+                if (shown <= limit) {
+                    before = substr($0, 1, rs - 1)
+                    after = substr($0, re + 1)
+                    new_line = before rtxt after
+                    
+                    if (nc) {
+                        printf "Original %d: %s\n", NR, $0
+                        printf "Replaced %d: %s\n\n", NR, new_line
+                    } else {
+                        printf "%sOriginal %d:%s %s%s\n", Y, NR, X, R, $0
+                        printf "%sReplaced %d:%s %s%s\n\n", Y, NR, X, G, new_line
+                    }
+                }
+            }
+        }
+        END { 
+            if (shown > limit) print "... +" (shown - limit) " more"
+            if (shown == 0) print "No matches found"
+            exit (shown == 0 ? 1 : 0)
+        }' "$file"
+}
+
+# ================= FIND MATCHING LINES =================
+find_matches() {
+    local file="$1" word="$2"
+    
+    awk -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" '
+        {
+            seg = (s && e) ? substr($0, s, e - s + 1) : $0
+            matched = regex ? match(seg, w) : index(seg, w)
+            if (matched) print NR
+        }' "$file"
+}
+
+# ================= WRITE MODIFIED LINES =================
+write_modified() {
     local file="$1"
     shift
     local lines=("$@")
-    local out="${file}_removed_$(date +%Y%m%d%H%M%S)"
+    local out="${file}_modified_$(date +%Y%m%d%H%M%S)"
     
-    (( DRY_RUN )) && { echo "$out"; return; }
+    (( DRY_RUN )) && return
     
-    > "$out" || err "Cannot create removed file: $out"
-    for l in "${lines[@]}"; do
-        sed -n "${l}p" "$file" >> "$out" || err "Cannot write to removed file"
+    > "$out" || err "Cannot create modified file: $out"
+    for line in "${lines[@]}"; do
+        sed -n "${line}p" "$file" >> "$out"
     done
     echo "$out"
 }
 
-# ================= DELETE LINES CORE =================
+# ================= DELETE LINES =================
 delete_lines() {
     local file="$1"
     shift
     local lines=("$@")
     
-    require_file "$file"
-    require_readable "$file"
-    require_writable "$file"
+    [[ -f "$file" ]] || err "File not found: $file"
+    [[ -r "$file" ]] || err "File not readable: $file"
+    [[ -w "$file" ]] || err "File not writable: $file"
+    (( ${#lines[@]} )) || err "No lines to delete"
     
-    (( ${#lines[@]} == 0 )) && err "No lines specified"
-    
-    # Deduplicate & sort
+    # Deduplicate and sort
     local uniq
-    IFS=$'\n' read -r -d '' -a uniq < <(
-        printf "%s\n" "${lines[@]}" | sort -n -u && printf '\0'
-    ) || true
+    IFS=$'\n' read -r -d '' -a uniq < <(printf "%s\n" "${lines[@]}" | sort -n -u && printf '\0') || true
     
     local total
-    total=$(get_total_lines "$file")
+    total=$(wc -l < "$file")
     
-    # Validate all line numbers
+    # Validate
     for L in "${uniq[@]}"; do
-        if ! [[ "$L" =~ ^[0-9]+$ ]]; then
-            err "Invalid line number: $L"
-        fi
-        if (( L < 1 || L > total )); then
-            err "Line $L out of range (1-$total)"
-        fi
-        if (( L == HEADER_LINE_NUM )); then
-            err "Cannot delete header (line $HEADER_LINE_NUM)"
-        fi
-        if (( L == total )); then
-            err "Cannot delete footer (line $total)"
-        fi
+        [[ "$L" =~ ^[0-9]+$ ]] || err "Invalid line number: $L"
+        (( L >= 1 && L <= total )) || err "Line $L out of range (1-$total)"
+        (( L != HEADER_LINE_NUM )) || err "Cannot delete header (line $HEADER_LINE_NUM)"
+        (( L != total )) || err "Cannot delete footer (line $total)"
     done
     
-    info "Will delete ${#uniq[@]} line(s): ${uniq[*]}"
+    info "Will delete ${#uniq[@]} line(s)"
     
     if (( DRY_RUN )); then
-        local new_footer
-        new_footer=$(compute_new_footer "$file" "${#uniq[@]}")
-        info "[DRY-RUN] New footer would be: $new_footer"
+        info "[DRY-RUN] New footer: $(compute_footer "$file" "${#uniq[@]}")"
         return 0
     fi
     
     confirm "Delete these lines?" || return
     
-    local removed backup tmp
-    removed=$(write_removed_file "$file" "${uniq[@]}")
-    backup=$(backup_file "$file")
-    tmp=$(create_temp_file)
-    _tmpfiles+=("$tmp")
+    local modified backup tmp new_footer
+    modified=$(write_modified "$file" "${uniq[@]}")
+    backup=$(create_backup "$file")
+    tmp=$(mktemp) || err "Cannot create temp file"
     
-    local deleted_count="${#uniq[@]}"
-    local new_footer
-    new_footer=$(compute_new_footer "$file" "$deleted_count")
+    new_footer=$(compute_footer "$file" "${#uniq[@]}")
     
     {
         sed -n '1p' "$file"
         sed "$(printf '%sd;' "${uniq[@]}")\$d" "$file" | sed '1d'
-        printf '%s\n' "$new_footer"
-    } > "$tmp" || err "Failed to build new file"
+        echo "$new_footer"
+    } > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
     
     mv "$tmp" "$file" || err "Failed to write changes"
-    info "Deleted. Backup: $backup | Removed rows: $removed"
+    info "Deleted ${#uniq[@]} lines"
+    info "Modified lines saved: $modified"
+}
+
+# ================= REPLACE TEXT =================
+replace_lines() {
+    local file="$1" word="$2" rs="$3" re="$4" rtxt="$5"
+    
+    [[ -f "$file" ]] || err "File not found: $file"
+    [[ -r "$file" ]] || err "File not readable: $file"
+    [[ -w "$file" ]] || err "File not writable: $file"
+    
+    # Validate replace positions
+    [[ "$rs" =~ ^[0-9]+$ && "$re" =~ ^[0-9]+$ ]] || err "Replace positions must be numbers"
+    (( rs >= 1 && re >= rs )) || err "Invalid replace range: $rs-$re"
+    
+    # Find matches
+    local -a match_lines
+    mapfile -t match_lines < <(find_matches "$file" "$word")
+    (( ${#match_lines[@]} )) || { echo "No matches found"; return 1; }
+    
+    info "Found ${#match_lines[@]} lines to replace"
+    
+    if (( DRY_RUN )); then
+        info "[DRY-RUN] Would replace text in ${#match_lines[@]} lines"
+        return 0
+    fi
+    
+    confirm "Replace text in ${#match_lines[@]} lines?" || return
+    
+    local modified backup tmp
+    modified=$(write_modified "$file" "${match_lines[@]}")
+    backup=$(create_backup "$file")
+    tmp=$(mktemp) || err "Cannot create temp file"
+    
+    awk -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
+        -v rs="$rs" -v re="$re" -v rtxt="$rtxt" '
+        {
+            seg = (s && e) ? substr($0, s, e - s + 1) : $0
+            matched = regex ? match(seg, w) : index(seg, w)
+            
+            if (matched) {
+                before = substr($0, 1, rs - 1)
+                after = substr($0, re + 1)
+                print before rtxt after
+            } else {
+                print $0
+            }
+        }' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to replace"; }
+    
+    mv "$tmp" "$file" || err "Failed to write changes"
+    info "Replaced text in ${#match_lines[@]} lines"
+    info "Modified lines saved: $modified"
 }
 
 # ================= KEYWORD SEARCH =================
 keyword_search() {
     local file="$1" word="$2"
     
-    require_file "$file"
-    require_readable "$file"
+    [[ -n "$word" ]] || err "Search word cannot be empty"
     
-    [[ -z "$word" ]] && err "Search word cannot be empty"
-    
-    preview_matches "$file" "$word"
-    
-    local all
-    mapfile -t all < <(
-        awk -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" '
-            {
-                seg = (s && e) ? substr($0, s, e-s+1) : $0
-                if (regex) {
-                    if (match(seg, w)) print NR
-                } else {
-                    if (index(seg, w)) print NR
-                }
-            }' "$file"
-    ) || err "Search failed"
-    
-    (( ${#all[@]} == 0 )) && { echo "No matches found"; return; }
-    
-    confirm "Delete all ${#all[@]} matched lines" || return
-    delete_lines "$file" "${all[@]}"
+    if (( REPLACE_MODE )); then
+        # Parse replace position
+        local rs re
+        IFS='-' read -r rs re <<< "$REPLACE_POS"
+        [[ -n "$rs" && -n "$re" ]] || err "--replace-pos format: start-end"
+        
+        preview_replacements "$file" "$word" "$rs" "$re" "$REPLACE_TXT" || return 1
+        replace_lines "$file" "$word" "$rs" "$re" "$REPLACE_TXT"
+    else
+        preview_matches "$file" "$word" || return 1
+        
+        local -a match_lines
+        mapfile -t match_lines < <(find_matches "$file" "$word")
+        delete_lines "$file" "${match_lines[@]}"
+    fi
 }
 
 # ================= ARGUMENT PARSING =================
-FILE=""
-LINE_NUM=""
-WORD=""
-EXTRA=()
-
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --no-color) NO_COLOR=1;;
-        --yes) YES_MODE=1;;
-        --dry-run) DRY_RUN=1;;
-        --force) FORCE_MODE=1;;
-        --regex) REGEX_MODE=1;;
+        -f) FILE="$2"; shift 2;;
+        -l) LINE_NUM="$2"; shift 2;;
+        -w) WORD="$2"; shift 2;;
+        -n) PREVIEW_LIMIT="$2"; shift 2;;
         --pos)
-            shift
-            [[ -z "$1" ]] && err "--pos requires argument"
-            IFS='-' read -r POS_START POS_END <<< "$1"
-            [[ -z "$POS_START" || -z "$POS_END" ]] && err "--pos format: start-end"
+            IFS='-' read -r POS_START POS_END <<< "$2"
+            [[ -n "$POS_START" && -n "$POS_END" ]] || err "--pos format: start-end"
+            shift 2
             ;;
-        *)
-            EXTRA+=("$1")
+        --replace-pos)
+            REPLACE_POS="$2"
+            REPLACE_MODE=1
+            shift 2
             ;;
-    esac
-    shift
-done
-
-set -- "${EXTRA[@]}"
-
-while getopts ":f:l:w:n:" o; do
-    case "$o" in
-        f) FILE="$OPTARG";;
-        l) LINE_NUM="$OPTARG";;
-        w) WORD="$OPTARG";;
-        n) PREVIEW_LIMIT="$OPTARG";;
-        :) err "Option -$OPTARG requires an argument";;
-        *) err "Invalid option: -$OPTARG";;
+        --replace-txt)
+            REPLACE_TXT="$2"
+            shift 2
+            ;;
+        --rollback) ROLLBACK=1; shift;;
+        --regex) REGEX_MODE=1; shift;;
+        --force) FORCE_MODE=1; shift;;
+        --yes) YES_MODE=1; shift;;
+        --dry-run) DRY_RUN=1; shift;;
+        --no-color) NO_COLOR=1; shift;;
+        *) err "Unknown option: $1";;
     esac
 done
 
 FILE=${FILE:-$DEFAULT_FILE}
 
+# Validate replace mode
+if (( REPLACE_MODE )); then
+    [[ -n "$REPLACE_POS" ]] || err "Replace mode requires --replace-pos"
+    [[ -n "$REPLACE_TXT" ]] || err "Replace mode requires --replace-txt"
+    [[ -n "$WORD" ]] || err "Replace mode requires -w <word>"
+fi
+
 # ================= MAIN EXECUTION =================
+if (( ROLLBACK )); then
+    rollback_file "$FILE"
+    exit 0
+fi
+
 if [[ -n "$LINE_NUM" ]]; then
-    require_file "$FILE"
-    init_temp_dir "$FILE"
+    [[ -f "$FILE" ]] || err "File not found: $FILE"
     preview_line "$FILE" "$LINE_NUM"
     confirm "Delete this line?" || exit 0
     delete_lines "$FILE" "$LINE_NUM"
@@ -365,8 +417,7 @@ if [[ -n "$LINE_NUM" ]]; then
 fi
 
 if [[ -n "$WORD" ]]; then
-    require_file "$FILE"
-    init_temp_dir "$FILE"
+    [[ -f "$FILE" ]] || err "File not found: $FILE"
     keyword_search "$FILE" "$WORD"
     exit 0
 fi
