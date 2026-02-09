@@ -9,11 +9,14 @@ elif [[ -f "./rem_line.sh" ]]; then
     SCRIPT="./rem_line.sh"
 elif [[ -f "./line_delete_v2.sh" ]]; then
     SCRIPT="./line_delete_v2.sh"
+elif [[ -f "./script.sh" ]]; then
+    SCRIPT="./script.sh"
 else
     echo "ERROR: Cannot find script. Looking for:"
     echo "  - ./line_delete.sh"
     echo "  - ./rem_line.sh"
     echo "  - ./line_delete_v2.sh"
+    echo "  - ./script.sh"
     exit 1
 fi
 
@@ -54,11 +57,6 @@ setup() {
 
 cleanup() {
     rm -rf "$TESTDIR"
-    # Clean up backup files in current directory (v2 style)
-    rm -f "${TESTDIR}/data.txt_backup" 2>/dev/null || true
-    rm -f "${TESTDIR}/data.txt_modified_"* 2>/dev/null || true
-    # Also clean up any backups in current directory
-    rm -f ./data.txt_backup ./data.txt_modified_* 2>/dev/null || true
 }
 
 trap cleanup EXIT
@@ -103,7 +101,8 @@ assert_output() {
 }
 
 run_cmd() {
-    eval "$SCRIPT $*" 2>&1 || true
+    # Redirect both stdout and stderr, suppress errors
+    "$SCRIPT" "$@" 2>&1 || true
 }
 
 # ================= FILE GENERATORS =================
@@ -160,9 +159,18 @@ get_backup_path() {
     echo "${1}_backup"
 }
 
+# Clean up test artifacts before each test
+clean_test_artifacts() {
+    rm -f "${FILE}_backup" "${FILE}_modified_"* 2>/dev/null || true
+}
+
+
 # ================= BASIC TESTS =================
 test_file_generation() {
     section "File Generation"
+    # Clean up any previous test artifacts
+    rm -f "${FILE}_backup" "${FILE}_modified_"* 2>/dev/null || true
+    
     generate_file 1000
     
     assert "generates 1002-line file" test "$(count_lines "$FILE")" -eq 1002
@@ -187,7 +195,7 @@ test_line_preview() {
     generate_file 1000
     
     local out
-    out=$(run_cmd "-f $FILE -l 500 --dry-run --yes")
+    out=$(run_cmd -f "$FILE" -l 500 --dry-run --yes)
     assert_output "preview shows target line" "500 |" "$out"
     assert_output "preview shows context before" "499 |" "$out"
     assert_output "preview shows context after" "501 |" "$out"
@@ -199,7 +207,7 @@ test_line_delete() {
     
     local before
     before=$(count_lines "$FILE")
-    run_cmd "-f $FILE -l 500 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 500 --yes --no-color >/dev/null 2>&1
     
     assert "deletes exactly one line" test "$(count_lines "$FILE")" -eq $((before - 1))
     assert "footer decremented" test "$(get_footer "$FILE")" = "FOOTERTEST00000999"
@@ -210,21 +218,29 @@ test_protection() {
     section "Header/Footer Protection"
     generate_file 100
     
-    local out
-    out=$(run_cmd "-f $FILE -l 1 --yes --no-color")
-    if echo "$out" | grep -qiE "(cannot delete|header)"; then
-        ok "header deletion blocked"
+    local before_lines
+    before_lines=$(count_lines "$FILE")
+    
+    # Try to delete header
+    run_cmd -f "$FILE" -l 1 --yes --no-color >/dev/null 2>&1
+    
+    local after_header
+    after_header=$(count_lines "$FILE")
+    if [[ "$after_header" == "$before_lines" ]]; then
+        ok "header deletion skipped"
     else
-        fail "header deletion should be blocked"
+        fail "header should be protected"
     fi
     
-    local lines
-    lines=$(count_lines "$FILE")
-    out=$(run_cmd "-f $FILE -l $lines --yes --no-color")
-    if echo "$out" | grep -qiE "(cannot delete|footer)"; then
-        ok "footer deletion blocked"
+    # Try to delete footer
+    run_cmd -f "$FILE" -l "$before_lines" --yes --no-color >/dev/null 2>&1
+    
+    local after_footer
+    after_footer=$(count_lines "$FILE")
+    if [[ "$after_footer" == "$before_lines" ]]; then
+        ok "footer deletion skipped"
     else
-        fail "footer deletion should be blocked"
+        fail "footer should be protected"
     fi
 }
 
@@ -234,7 +250,7 @@ test_keyword_search() {
     generate_file 1000
     
     local out
-    out=$(run_cmd "-f $FILE -w ITEM-0420 --dry-run --yes --no-color")
+    out=$(run_cmd -f "$FILE" -w ITEM-0420 --dry-run --yes --no-color)
     assert_output "finds exact keyword" "ITEM-0420" "$out"
     assert_output "shows match preview" "Matches" "$out"
 }
@@ -245,7 +261,7 @@ test_keyword_delete() {
     
     local before
     before=$(count_lines "$FILE")
-    run_cmd "-f $FILE -w 'CAT=A' --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w 'CAT=A' --yes --no-color >/dev/null 2>&1
     
     local after
     after=$(count_lines "$FILE")
@@ -263,7 +279,7 @@ test_position_filter() {
     generate_file 1000
     
     local out
-    out=$(run_cmd "-f $FILE -w ITEM --pos 10-20 -n 5 --dry-run --yes --no-color")
+    out=$(run_cmd -f "$FILE" -w ITEM --pos 10-20 -n 5 --dry-run --yes --no-color)
     assert_output "finds matches in position range" "Matches" "$out"
 }
 
@@ -273,7 +289,7 @@ test_replace_preview() {
     generate_test_file
     
     local out
-    out=$(run_cmd "-f $FILE -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --dry-run --yes --no-color")
+    out=$(run_cmd -f "$FILE" -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --dry-run --yes --no-color)
     assert_output "shows original lines" "Original" "$out"
     assert_output "shows replaced lines" "Replaced" "$out"
     assert_output "shows replacement text" "RESOLVED" "$out"
@@ -285,7 +301,7 @@ test_replace_text() {
     
     local before
     before=$(count_lines "$FILE")
-    run_cmd "-f $FILE -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --yes --no-color >/dev/null 2>&1
     
     local after
     after=$(count_lines "$FILE")
@@ -298,16 +314,17 @@ test_replace_with_pos() {
     section "Replace with Position Search"
     generate_test_file
     
-    run_cmd "-f $FILE --pos 1-5 -w ERROR --replace-pos 1-8 --replace-txt FIXED___ --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" --pos 1-5 -w ERROR --replace-pos 1-8 --replace-txt FIXED___ --yes --no-color >/dev/null 2>&1
     
     assert "replace with pos filter works" has_line "FIXED___" "$FILE"
 }
 
 test_replace_tracking() {
     section "Replace Modified Tracking"
+    clean_test_artifacts
     generate_test_file
     
-    run_cmd "-f $FILE -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --yes --no-color >/dev/null 2>&1
     
     assert "modified file created" modified_exists "$FILE"
     
@@ -329,9 +346,10 @@ test_replace_tracking() {
 # ================= BACKUP TESTS =================
 test_backup_creation() {
     section "Backup Creation"
+    clean_test_artifacts  # Remove any previous backups
     generate_file 100
     
-    run_cmd "-f $FILE -l 50 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 50 --yes --no-color >/dev/null 2>&1
     
     assert "backup file created" backup_exists "$FILE"
     
@@ -346,10 +364,11 @@ test_backup_creation() {
 
 test_backup_reuse() {
     section "Backup Reuse"
+    clean_test_artifacts
     generate_file 100
     
     # First operation creates backup
-    run_cmd "-f $FILE -l 50 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 50 --yes --no-color >/dev/null 2>&1
     local backup_path
     backup_path=$(get_backup_path "$FILE")
     local backup_time
@@ -358,7 +377,7 @@ test_backup_reuse() {
     sleep 1
     
     # Second operation should reuse backup
-    run_cmd "-f $FILE -l 60 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 60 --yes --no-color >/dev/null 2>&1
     local backup_time2
     backup_time2=$(stat -c %Y "$backup_path" 2>/dev/null || stat -f %m "$backup_path" 2>/dev/null)
     
@@ -367,21 +386,22 @@ test_backup_reuse() {
 
 test_rollback() {
     section "Rollback Operation"
+    clean_test_artifacts
     generate_file 100
     
     local original_lines
     original_lines=$(count_lines "$FILE")
     
     # Make changes
-    run_cmd "-f $FILE -l 50 --yes --no-color" >/dev/null
-    run_cmd "-f $FILE -l 60 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 50 --yes --no-color >/dev/null 2>&1
+    run_cmd -f "$FILE" -l 60 --yes --no-color >/dev/null 2>&1
     
     local modified_lines
     modified_lines=$(count_lines "$FILE")
     assert "changes applied" test "$modified_lines" -lt "$original_lines"
     
     # Rollback
-    run_cmd "-f $FILE --rollback --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" --rollback --yes --no-color >/dev/null 2>&1
     
     local restored_lines
     restored_lines=$(count_lines "$FILE")
@@ -396,7 +416,7 @@ test_rollback_without_backup() {
     rm -f "$backup_path" 2>/dev/null || true
     
     local out
-    out=$(run_cmd "-f $FILE --rollback --yes --no-color")
+    out=$(run_cmd -f "$FILE" --rollback --yes --no-color)
     
     if echo "$out" | grep -qiE "(not found|backup)"; then
         ok "rollback fails without backup"
@@ -411,7 +431,7 @@ test_regex_matching() {
     generate_file 1000
     
     local out
-    out=$(run_cmd "-f $FILE -w 'ITEM-0[0-9]{3}' --regex --dry-run --yes --no-color")
+    out=$(run_cmd -f "$FILE" -w 'ITEM-0[0-9]{3}' --regex --dry-run --yes --no-color)
     assert_output "regex finds pattern" "ITEM-0" "$out"
     assert_output "shows matches" "Matches" "$out"
 }
@@ -421,8 +441,8 @@ test_regex_vs_literal() {
     generate_file 1000
     
     local out_literal out_regex
-    out_literal=$(run_cmd "-f $FILE -w '[0-9]' --dry-run --yes --no-color")
-    out_regex=$(run_cmd "-f $FILE -w '[0-9]' --regex --dry-run --yes --no-color")
+    out_literal=$(run_cmd -f "$FILE" -w '[0-9]' --dry-run --yes --no-color)
+    out_regex=$(run_cmd -f "$FILE" -w '[0-9]' --regex --dry-run --yes --no-color)
     
     if echo "$out_literal" | grep -q "No matches"; then
         ok "literal [0-9] finds nothing"
@@ -443,7 +463,7 @@ test_regex_delete() {
     
     local before
     before=$(count_lines "$FILE")
-    run_cmd "-f $FILE -w 'CAT=A' --regex --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w 'CAT=A' --regex --yes --no-color >/dev/null 2>&1
     
     local after
     after=$(count_lines "$FILE")
@@ -460,7 +480,7 @@ test_regex_replace() {
     section "Regex Replace"
     generate_test_file
     
-    run_cmd "-f $FILE -w 'ERROR[0-9]+' --regex --replace-pos 1-8 --replace-txt FIXED___ --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w 'ERROR[0-9]+' --regex --replace-pos 1-8 --replace-txt FIXED___ --yes --no-color >/dev/null 2>&1
     
     assert "regex replace works" has_line "FIXED___" "$FILE"
     assert "original removed" has_no_line "ERROR001" "$FILE"
@@ -472,7 +492,7 @@ test_preview_limit() {
     generate_file 1000
     
     local out
-    out=$(run_cmd "-f $FILE -w CAT -n 3 --dry-run --yes --no-color")
+    out=$(run_cmd -f "$FILE" -w CAT -n 3 --dry-run --yes --no-color)
     
     if echo "$out" | grep -qE "\+.*more"; then
         ok "shows overflow indicator"
@@ -490,7 +510,7 @@ test_dry_run() {
     local before_lines
     before_lines=$(count_lines "$FILE")
     
-    run_cmd "-f $FILE -l 50 --dry-run --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 50 --dry-run --yes --no-color >/dev/null 2>&1
     
     local after
     after=$(cat "$FILE")
@@ -500,9 +520,10 @@ test_dry_run() {
 
 test_modified_tracking() {
     section "Modified Line Tracking"
+    clean_test_artifacts
     generate_file 100
     
-    run_cmd "-f $FILE -l 50 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 50 --yes --no-color >/dev/null 2>&1
     
     assert "modified file created" modified_exists "$FILE"
     
@@ -520,14 +541,14 @@ test_edge_cases() {
     generate_file 100
     
     local out
-    out=$(run_cmd "-f $FILE -l 99999 --yes --no-color")
+    out=$(run_cmd -f "$FILE" -l 99999 --yes --no-color)
     if echo "$out" | grep -qiE "(out of range|invalid)"; then
         ok "rejects out-of-range line"
     else
         fail "should reject out-of-range line"
     fi
     
-    out=$(run_cmd "-f /nonexistent.txt -l 1 --yes --no-color")
+    out=$(run_cmd -f /nonexistent.txt -l 1 --yes --no-color)
     if echo "$out" | grep -qiE "(not found|no such)"; then
         ok "rejects non-existent file"
     else
@@ -543,17 +564,17 @@ test_bulk_operations() {
     before=$(count_lines "$FILE")
     
     # Delete lines, accounting for shifting line numbers
-    run_cmd "-f $FILE -l 100 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 100 --yes --no-color >/dev/null 2>&1
     local after1
     after1=$(count_lines "$FILE")
     
     # After first delete, line 200 is now line 199
-    run_cmd "-f $FILE -l 99 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 99 --yes --no-color >/dev/null 2>&1
     local after2
     after2=$(count_lines "$FILE")
     
     # After second delete, line 150 is now line 148
-    run_cmd "-f $FILE -l 98 --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -l 98 --yes --no-color >/dev/null 2>&1
     local after3
     after3=$(count_lines "$FILE")
     
@@ -565,7 +586,7 @@ test_footer_integrity() {
     generate_file 200
     
     for i in {50,100,150}; do
-        run_cmd "-f $FILE -l $i --yes --no-color" >/dev/null
+        run_cmd -f "$FILE" -l $i --yes --no-color >/dev/null 2>&1
     done
     
     local footer_num
@@ -578,8 +599,8 @@ test_color_output() {
     generate_file 100
     
     local out_color out_nocolor
-    out_color=$(run_cmd "-f $FILE -l 50 --dry-run --yes")
-    out_nocolor=$(run_cmd "-f $FILE -l 50 --dry-run --yes --no-color")
+    out_color=$(run_cmd -f "$FILE" -l 50 --dry-run --yes)
+    out_nocolor=$(run_cmd -f "$FILE" -l 50 --dry-run --yes --no-color)
     
     if [[ "$out_color" == *$'\033'* ]]; then
         ok "color output has ANSI codes"
@@ -596,25 +617,40 @@ test_color_output() {
 
 test_complex_workflow() {
     section "Complex Workflow"
+    clean_test_artifacts
     generate_test_file
     
+    # Save original for comparison
+    local original_content
+    original_content=$(cat "$FILE")
+    
     # Delete some lines
-    run_cmd "-f $FILE -w INFO --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w INFO --yes --no-color >/dev/null 2>&1
     
     # Replace some text
-    run_cmd "-f $FILE -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --yes --no-color >/dev/null 2>&1
     
-    # Verify
+    # Verify modifications
     assert "workflow: INFO deleted" has_no_line "INFO" "$FILE"
     assert "workflow: ERROR replaced" has_line "RESOLVED" "$FILE"
     assert "workflow: backup exists" backup_exists "$FILE"
     assert "workflow: modified files exist" modified_exists "$FILE"
     
     # Rollback everything
-    run_cmd "-f $FILE --rollback --yes --no-color" >/dev/null
+    run_cmd -f "$FILE" --rollback --yes --no-color >/dev/null 2>&1
     
-    assert "workflow: rollback restores INFO" has_line "INFO" "$FILE"
-    assert "workflow: rollback restores ERROR" has_line "ERROR" "$FILE"
+    # Verify rollback
+    if has_line "INFO" "$FILE"; then
+        ok "workflow: rollback restores INFO"
+    else
+        fail "workflow: rollback restores INFO (file content after rollback: $(head -5 "$FILE"))"
+    fi
+    
+    if has_line "ERROR" "$FILE"; then
+        ok "workflow: rollback restores ERROR"
+    else
+        fail "workflow: rollback restores ERROR (file content after rollback: $(head -5 "$FILE"))"
+    fi
 }
 
 # ================= RUN ALL TESTS =================
@@ -626,12 +662,16 @@ main() {
     
     setup
     
-    # Wrapper to catch test failures
+    # Wrapper to catch test failures and prevent crashes
     run_test() {
         local test_name="$1"
-        if ! "$test_name" 2>&1; then
-            echo -e "${RED}Test crashed: $test_name${RESET}"
+        # Run test in subshell to prevent set -e from affecting main script
+        if ( "$test_name" ) 2>&1; then
+            return 0
+        else
+            echo -e "${RED}  Test function failed: $test_name${RESET}"
             ((FAIL++))
+            return 1
         fi
     }
     
