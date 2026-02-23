@@ -190,7 +190,7 @@ Lines to be deleted (preview):
   5000 | CRITICAL: Corruption detected ← TARGET
   5001 | Skipped transaction
 
-[DRY-RUN] New footer would be: 9END00009999
+[DRY-RUN] New footer would be: FOOTERTEST00009999
 ```
 
 ### Example 2: Bulk Delete All Error Lines
@@ -264,14 +264,38 @@ $ ./rem_line.sh -f huge_file.dat -w "DEPRECATED" --yes 2>&1 | tee deletion.log
 
 ## Testing
 
-### Run Unit Test Suite
+### Option 1: Bash test suite
 
 ```bash
-chmod +x test_suite.sh
-./test_suite.sh
+chmod +x test_suit.sh
+./test_suit.sh
 ```
 
-### Expected Output
+### Option 2: Robot Framework (per-case directories for inspection)
+
+Each test gets its own directory under `robot_test_runs/` so you can inspect inputs and outputs after a run.
+
+**Install:**
+
+```bash
+pip install -r requirements-robot.txt
+```
+
+**Run (from project root):**
+
+```bash
+robot --outputdir robot_output robot/rem_line_tests.robot
+```
+
+**Inspect results:**
+
+- Report: `robot_output/report.html`, log: `robot_output/log.html`
+- Per-test data: `robot_test_runs/<Test_Case_Name>/`
+  - `data.txt` – file after test (or as left by the script)
+  - `data.txt.initial` – copy before changes (where applicable)
+  - `data.txt_backup`, `data.txt_modified_*` – created by the script when relevant
+
+### Expected Output (bash suite)
 
 ```
 ================================
@@ -316,8 +340,8 @@ bash test_suite.sh 2>&1 | grep "Delete" -A 3
 tail -n 1 data.txt
 
 # Update FOOTER_PATTERN to match, e.g.:
-# Current: 9END00001000
-# Pattern: ^9END[0-9]+$
+# Current: FOOTERTEST00001000
+# Pattern: ^FOOTERTEST[0-9]+$
 ```
 
 ### Issue: "Cannot delete header/footer"

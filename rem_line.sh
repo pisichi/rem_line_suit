@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ================= EXIT CODES =================
+# All exit paths use these constants. See --help for user-facing summary.
+EXIT_SUCCESS=0
+EXIT_FAILURE=1
+EXIT_USAGE=2
+
 # ================= COLORS =================
 RED='\033[31;1m'
 YELLOW='\033[33;1m'
@@ -57,7 +63,14 @@ make_temp() {
 }
 
 # ================= UTILITIES =================
-err() { echo "Error: $*" >&2; exit 1; }
+# Usage: err "message" [exit_code]
+# Default exit_code is EXIT_FAILURE. Use EXIT_USAGE for bad arguments.
+err() {
+    local msg="$1"
+    local code="${2:-$EXIT_FAILURE}"
+    echo "Error: $msg" >&2
+    exit "$code"
+}
 
 show_help() {
     cat << 'EOF'
@@ -113,8 +126,13 @@ NOTES:
   - Backups are created automatically as: <filename>_backup
   - Temp files are created in the same directory as the source file
 
+EXIT CODES:
+  0  Success (or user declined confirmation)
+  1  Failure (e.g. file error, no matches, rollback failed)
+  2  Usage error (invalid or missing options)
+
 EOF
-    exit 0
+    exit "$EXIT_SUCCESS"
 }
 
 info() {
@@ -435,7 +453,7 @@ replace_lines() {
     # Find matches
     local -a match_lines
     mapfile -t match_lines < <(find_matches "$file" "$word")
-    (( ${#match_lines[@]} )) || { echo "No matches found"; return 1; }
+    (( ${#match_lines[@]} )) || { echo "Error: No matches found" >&2; return 1; }
     
     # Filter out header and footer
     local total
@@ -524,7 +542,7 @@ keyword_search() {
         # Parse replace position
         local rs re
         IFS='-' read -r rs re <<< "$REPLACE_POS"
-        [[ -n "$rs" && -n "$re" ]] || err "--replace-pos format: start-end"
+        [[ -n "$rs" && -n "$re" ]] || err "--replace-pos format: start-end" "$EXIT_USAGE"
         
         preview_replacements "$file" "$word" "$rs" "$re" "$REPLACE_TXT" || return 1
         replace_lines "$file" "$word" "$rs" "$re" "$REPLACE_TXT"
@@ -547,9 +565,9 @@ while [[ $# -gt 0 ]]; do
         -n) PREVIEW_LIMIT="$2"; shift 2;;
         --pos)
             IFS='-' read -r POS_START POS_END <<< "$2"
-            [[ -n "$POS_START" && -n "$POS_END" ]] || err "--pos format: start-end"
-            [[ "$POS_START" =~ ^[0-9]+$ && "$POS_END" =~ ^[0-9]+$ ]] || err "--pos: start and end must be numbers"
-            (( POS_START >= 1 && POS_END >= POS_START )) || err "--pos: invalid range $POS_START-$POS_END"
+            [[ -n "$POS_START" && -n "$POS_END" ]] || err "--pos format: start-end" "$EXIT_USAGE"
+            [[ "$POS_START" =~ ^[0-9]+$ && "$POS_END" =~ ^[0-9]+$ ]] || err "--pos: start and end must be numbers" "$EXIT_USAGE"
+            (( POS_START >= 1 && POS_END >= POS_START )) || err "--pos: invalid range $POS_START-$POS_END" "$EXIT_USAGE"
             shift 2
             ;;
         --replace-pos)
@@ -567,7 +585,7 @@ while [[ $# -gt 0 ]]; do
         --yes) YES_MODE=1; shift;;
         --dry-run) DRY_RUN=1; shift;;
         --no-color) NO_COLOR=1; shift;;
-        *) err "Unknown option: $1";;
+        *) err "Unknown option: $1" "$EXIT_USAGE";;
     esac
 done
 
@@ -575,15 +593,15 @@ FILE=${FILE:-$DEFAULT_FILE}
 
 # Validate replace mode
 if (( REPLACE_MODE )); then
-    [[ -n "$REPLACE_POS" ]] || err "Replace mode requires --replace-pos"
-    [[ -n "$REPLACE_TXT" ]] || err "Replace mode requires --replace-txt"
-    [[ -n "$WORD" ]] || err "Replace mode requires -w <word>"
+    [[ -n "$REPLACE_POS" ]] || err "Replace mode requires --replace-pos" "$EXIT_USAGE"
+    [[ -n "$REPLACE_TXT" ]] || err "Replace mode requires --replace-txt" "$EXIT_USAGE"
+    [[ -n "$WORD" ]] || err "Replace mode requires -w <word>" "$EXIT_USAGE"
 fi
 
 # ================= MAIN EXECUTION =================
 if (( ROLLBACK )); then
     rollback_file "$FILE"
-    exit 0
+    exit "$EXIT_SUCCESS"
 fi
 
 # VALIDATE FOOTER FORMAT FIRST (before any operations)
@@ -594,15 +612,15 @@ fi
 if [[ -n "$LINE_NUM" ]]; then
     [[ -f "$FILE" ]] || err "File not found: $FILE"
     preview_line "$FILE" "$LINE_NUM"
-    confirm "Delete this line?" || exit 0
+    confirm "Delete this line?" || exit "$EXIT_SUCCESS"
     delete_lines "$FILE" "$LINE_NUM"
-    exit 0
+    exit "$EXIT_SUCCESS"
 fi
 
 if [[ -n "$WORD" ]]; then
     [[ -f "$FILE" ]] || err "File not found: $FILE"
-    keyword_search "$FILE" "$WORD"
-    exit 0
+    keyword_search "$FILE" "$WORD" || exit "$EXIT_FAILURE"
+    exit "$EXIT_SUCCESS"
 fi
 
-err "Provide either -l <line_num> or -w <word>"
+err "Provide either -l <line_num> or -w <word>" "$EXIT_USAGE"
