@@ -20,6 +20,7 @@ FORCE_MODE=0
 YES_MODE=0
 DRY_RUN=0
 NO_COLOR=0
+NO_HEADER_FOOTER=0
 DEFAULT_FILE="./data.txt"
 
 # Search/Replace settings
@@ -96,6 +97,8 @@ FILE OPTIONS:
   -n NUM                   Preview limit for matches (default: 10)
 
 CONTROL OPTIONS:
+  --no-header-footer       Disable header/footer protection and footer tracking.
+                           Use this for plain files without a structured header/footer.
   --yes                    Skip all confirmation prompts
   --dry-run                Show what would happen without making changes
   --no-color               Disable colored output
@@ -120,9 +123,13 @@ EXAMPLES:
   # Restore from backup
   script.sh --rollback
 
+  # Operate on a plain file without header/footer
+  script.sh -f plain.txt -w "old" --replace-pos 1-3 --replace-txt "new" --no-header-footer
+
 NOTES:
   - Header (line 1) and footer (last line) are protected and cannot be modified
   - Footer must match pattern: FOOTERTEST########
+  - Use --no-header-footer for plain files that lack this structure
   - Backups are created automatically as: <filename>_backup
   - Temp files are created in the same directory as the source file
 
@@ -154,15 +161,26 @@ validate_file() {
     
     local total
     total=$(wc -l < "$file")
-    (( total >= 2 )) || err "File must have at least 2 lines (header + footer), found $total"
+
+    if (( NO_HEADER_FOOTER )); then
+        (( total >= 1 )) || err "File must have at least 1 line, found $total"
+    else
+        (( total >= 2 )) || err "File must have at least 2 lines (header + footer), found $total"
+    fi
 }
 
 validate_footer() {
     local file="$1"
-    local footer
+    
+    # Skip all footer/header validation in no-header-footer mode
+    if (( NO_HEADER_FOOTER )); then
+        validate_file "$file"
+        return 0
+    fi
     
     validate_file "$file"
     
+    local footer
     footer=$(tail -n 1 "$file" | tr -d '[:space:]')
     [[ "$footer" =~ $FOOTER_PATTERN ]] || err "Invalid footer format: $footer (expected pattern: ${FOOTER_PREFIX}########)"
     
@@ -198,8 +216,10 @@ rollback_file() {
     
     [[ -f "$backup" ]] || err "Backup file not found: $backup"
     
-    # Validate backup file has valid footer
-    validate_footer "$backup"
+    # Only validate footer on rollback when not in no-header-footer mode
+    if (( ! NO_HEADER_FOOTER )); then
+        validate_footer "$backup"
+    fi
     
     info "Current file lines: $(wc -l < "$file")"
     info "Backup file lines: $(wc -l < "$backup")"
@@ -234,11 +254,13 @@ preview_line() {
     
     (( line < 1 || line > total )) && err "Line $line out of range (1-$total)"
     
-    # Warn if trying to preview protected lines
-    if (( line == HEADER_LINE_NUM )); then
-        info "WARNING: Line $line is the HEADER (protected)" >&2
-    elif (( line == total )); then
-        info "WARNING: Line $line is the FOOTER (protected)" >&2
+    # Warn if trying to preview protected lines (only in header/footer mode)
+    if (( ! NO_HEADER_FOOTER )); then
+        if (( line == HEADER_LINE_NUM )); then
+            info "WARNING: Line $line is the HEADER (protected)" >&2
+        elif (( line == total )); then
+            info "WARNING: Line $line is the FOOTER (protected)" >&2
+        fi
     fi
     
     local start=$((line > 1 ? line - 1 : 1))
@@ -380,7 +402,7 @@ delete_lines() {
     local total
     total=$(wc -l < "$file")
     
-    # Filter out header and footer, track what was skipped
+    # Filter out header and footer (only in normal mode), track what was skipped
     local -a filtered skipped_lines
     local skipped_header=0 skipped_footer=0
     
@@ -388,12 +410,16 @@ delete_lines() {
         [[ "$L" =~ ^[0-9]+$ ]] || err "Invalid line number: $L"
         (( L >= 1 && L <= total )) || err "Line $L out of range (1-$total)"
         
-        if (( L == HEADER_LINE_NUM )); then
-            skipped_header=1
-            skipped_lines+=("$L (header)")
-        elif (( L == total )); then
-            skipped_footer=1
-            skipped_lines+=("$L (footer)")
+        if (( ! NO_HEADER_FOOTER )); then
+            if (( L == HEADER_LINE_NUM )); then
+                skipped_header=1
+                skipped_lines+=("$L (header)")
+            elif (( L == total )); then
+                skipped_footer=1
+                skipped_lines+=("$L (footer)")
+            else
+                filtered+=("$L")
+            fi
         else
             filtered+=("$L")
         fi
@@ -413,25 +439,32 @@ delete_lines() {
     info "Will delete ${#filtered[@]} line(s)"
     
     if (( DRY_RUN )); then
-        info "[DRY-RUN] New footer: $(compute_footer "$file" "${#filtered[@]}")"
+        if (( ! NO_HEADER_FOOTER )); then
+            info "[DRY-RUN] New footer: $(compute_footer "$file" "${#filtered[@]}")"
+        fi
         return 0
     fi
     
     confirm "Delete these lines?" || return
     
     # Create backup and write modified AFTER filtering
-    local backup modified tmp new_footer
+    local backup modified tmp
     backup=$(create_backup "$file")
     modified=$(write_modified "$file" "${filtered[@]}")
     tmp=$(make_temp "$file")
     
-    new_footer=$(compute_footer "$file" "${#filtered[@]}")
-    
-    {
-        sed -n '1p' "$file"
-        sed "$(printf '%sd;' "${filtered[@]}")\$d" "$file" | sed '1d'
-        echo "$new_footer"
-    } > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+    if (( NO_HEADER_FOOTER )); then
+        # Simple delete: no header/footer preservation or footer update
+        sed "$(printf '%sd;' "${filtered[@]}")" "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+    else
+        local new_footer
+        new_footer=$(compute_footer "$file" "${#filtered[@]}")
+        {
+            sed -n '1p' "$file"
+            sed "$(printf '%sd;' "${filtered[@]}")\$d" "$file" | sed '1d'
+            echo "$new_footer"
+        } > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+    fi
     
     mv "$tmp" "$file" || err "Failed to write changes"
     info "Deleted ${#filtered[@]} lines"
@@ -455,7 +488,6 @@ replace_lines() {
     mapfile -t match_lines < <(find_matches "$file" "$word")
     (( ${#match_lines[@]} )) || { echo "Error: No matches found" >&2; return 1; }
     
-    # Filter out header and footer
     local total
     total=$(wc -l < "$file")
     
@@ -463,12 +495,16 @@ replace_lines() {
     local skipped_header=0 skipped_footer=0
     
     for L in "${match_lines[@]}"; do
-        if (( L == HEADER_LINE_NUM )); then
-            skipped_header=1
-            skipped_lines+=("$L (header)")
-        elif (( L == total )); then
-            skipped_footer=1
-            skipped_lines+=("$L (footer)")
+        if (( ! NO_HEADER_FOOTER )); then
+            if (( L == HEADER_LINE_NUM )); then
+                skipped_header=1
+                skipped_lines+=("$L (header)")
+            elif (( L == total )); then
+                skipped_footer=1
+                skipped_lines+=("$L (footer)")
+            else
+                filtered+=("$L")
+            fi
         else
             filtered+=("$L")
         fi
@@ -499,13 +535,23 @@ replace_lines() {
     modified=$(write_modified "$file" "${filtered[@]}")
     tmp=$(make_temp "$file")
     
+    # In no-header-footer mode, treat all lines equally (header=0 / footer=0 won't match real lines)
+    local awk_header awk_footer
+    if (( NO_HEADER_FOOTER )); then
+        awk_header=0
+        awk_footer=0
+    else
+        awk_header="$HEADER_LINE_NUM"
+        awk_footer="$total"
+    fi
+
     # Validate replace positions against actual line lengths
     awk -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
         -v rs="$rs" -v re="$re" -v rtxt="$rtxt" \
-        -v header="$HEADER_LINE_NUM" -v footer="$total" '
+        -v header="$awk_header" -v footer="$awk_footer" '
         {
-            # Skip header and footer
-            if (NR == header || NR == footer) {
+            # Skip header and footer (skipped when header/footer == 0 since NR starts at 1)
+            if ((header != 0 && NR == header) || (footer != 0 && NR == footer)) {
                 print $0
                 next
             }
@@ -585,6 +631,7 @@ while [[ $# -gt 0 ]]; do
         --yes) YES_MODE=1; shift;;
         --dry-run) DRY_RUN=1; shift;;
         --no-color) NO_COLOR=1; shift;;
+        --no-header-footer) NO_HEADER_FOOTER=1; shift;;
         *) err "Unknown option: $1" "$EXIT_USAGE";;
     esac
 done
@@ -604,7 +651,7 @@ if (( ROLLBACK )); then
     exit "$EXIT_SUCCESS"
 fi
 
-# VALIDATE FOOTER FORMAT FIRST (before any operations)
+# VALIDATE FOOTER FORMAT FIRST (before any operations, skipped in no-header-footer mode)
 if [[ -n "$LINE_NUM" || -n "$WORD" ]]; then
     validate_footer "$FILE"
 fi
