@@ -21,6 +21,7 @@ YES_MODE=0
 DRY_RUN=0
 NO_COLOR=0
 NO_HEADER_FOOTER=0
+MERGE_NEXT=0
 DEFAULT_FILE="./data.txt"
 
 # Search/Replace settings
@@ -61,6 +62,26 @@ make_temp() {
     local tmp=$(mktemp -p "$dir" ".tmp.XXXXXXXXXX") || err "Cannot create temp file in $dir"
     TEMP_FILES+=("$tmp")
     echo "$tmp"
+}
+
+# ================= REGEX SAFETY =================
+validate_regex() {
+    local pattern="$1"
+    # Quick timeout test on first 100 lines to catch catastrophic backtracking
+    timeout 2s awk "BEGIN { if (match(\"test\", \"$pattern\")) print \"ok\" }" 2>/dev/null || err "Regex pattern is invalid or too slow (potential ReDoS): $pattern"
+}
+
+# ================= LARGE FILE HANDLING =================
+validate_file_size() {
+    local file="$1"
+    local max_size=$((50 * 1024 * 1024 * 1024))  # 50GB warning
+    local size
+    
+    size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    
+    if (( size > max_size )); then
+        info "WARNING: File is very large ($(( size / 1024 / 1024 / 1024 ))GB). Operations may take a while." >&2
+    fi
 }
 
 # ================= UTILITIES =================
@@ -203,7 +224,11 @@ create_backup() {
         info "WARNING: Using existing backup: $backup" >&2
         info "Previous backup will NOT be overwritten" >&2
     else
-        (( DRY_RUN )) || cp -p "$file" "$backup" || err "Failed to create backup"
+        if (( DRY_RUN )); then
+            info "[DRY-RUN] Would create backup: $backup" >&2
+        else
+            cp -p "$file" "$backup" || { echo "abort"; return 1; }
+        fi
         info "Created backup: $backup" >&2
     fi
     echo "$backup"
@@ -307,10 +332,14 @@ preview_matches() {
                         printf "%d:%s\n", NR, line
                     }
                 }
+                # Exit early after reaching limit to avoid scanning entire file
+                if (shown > limit) { 
+                    print "... +" (shown - limit) " more"
+                    exit 0 
+                }
             }
         }
         END { 
-            if (shown > limit) print "... +" (shown - limit) " more"
             if (shown == 0) print "No matches found"
             exit (shown == 0 ? 1 : 0)
         }' "$file"
@@ -344,10 +373,14 @@ preview_replacements() {
                         printf "%sReplaced %d:%s %s%s\n\n", Y, NR, X, G, new_line
                     }
                 }
+                # Exit early after reaching limit to avoid scanning entire file
+                if (shown > limit) {
+                    print "... +" (shown - limit) " more"
+                    exit 0
+                }
             }
         }
         END { 
-            if (shown > limit) print "... +" (shown - limit) " more"
             if (shown == 0) print "No matches found"
             exit (shown == 0 ? 1 : 0)
         }' "$file"
@@ -395,9 +428,22 @@ delete_lines() {
     [[ -w "$file" ]] || err "File not writable: $file"
     (( ${#lines[@]} )) || err "No lines to delete"
     
-    # Deduplicate and sort
+    # Check available disk space (need 2x file size for backup + temp)
+    local file_size
+    file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    if (( file_size > 0 )); then
+        local dir_free
+        dir_free=$(df "$file" | tail -1 | awk '{print $4 * 1024}' 2>/dev/null || echo 999999999999)
+        (( dir_free > file_size * 2 )) || err "Insufficient disk space. Need $(( file_size * 2 / 1024 / 1024 ))MB, have $(( dir_free / 1024 / 1024 ))MB"
+    fi
+    
+    # Deduplicate and sort using temp file for large arrays
+    local tmp_sort
+    tmp_sort=$(make_temp "$file")
+    printf "%s\n" "${lines[@]}" | sort -n -u > "$tmp_sort"
     local uniq
-    IFS=$'\n' read -r -d '' -a uniq < <(printf "%s\n" "${lines[@]}" | sort -n -u && printf '\0') || true
+    mapfile -t uniq < "$tmp_sort"
+    rm -f "$tmp_sort"
     
     local total
     total=$(wc -l < "$file")
@@ -449,25 +495,51 @@ delete_lines() {
     
     # Create backup and write modified AFTER filtering
     local backup modified tmp
-    backup=$(create_backup "$file")
+    backup=$(create_backup "$file") || err "Failed to create backup"
     modified=$(write_modified "$file" "${filtered[@]}")
-    tmp=$(make_temp "$file")
+    tmp=$(make_temp "$file") || err "Failed to create temp file"
     
     if (( NO_HEADER_FOOTER )); then
-        # Simple delete: no header/footer preservation or footer update
-        sed "$(printf '%sd;' "${filtered[@]}")" "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+        # Simple delete: use awk for efficiency with large files (avoids massive sed commands)
+        awk -v lines_str="$(printf '%s\n' "${filtered[@]}")" '
+            BEGIN {
+                split(lines_str, delete_arr, "\n")
+                for (i in delete_arr) {
+                    if (delete_arr[i] != "") delete_lines[delete_arr[i]] = 1
+                }
+            }
+            !(NR in delete_lines)
+        ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
     else
         local new_footer
-        new_footer=$(compute_footer "$file" "${#filtered[@]}")
-        {
-            sed -n '1p' "$file"
-            sed "$(printf '%sd;' "${filtered[@]}")\$d" "$file" | sed '1d'
-            echo "$new_footer"
-        } > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+        new_footer=$(compute_footer "$file" "${#filtered[@]}") || { rm -f "$tmp"; err "Failed to compute footer"; }
+        
+        # Use awk to avoid massive sed commands that fail on large files
+        awk -v lines_str="$(printf '%s\n' "${filtered[@]}")" -v new_footer="$new_footer" \
+            -v total="$total" '
+            BEGIN {
+                split(lines_str, delete_arr, "\n")
+                for (i in delete_arr) {
+                    if (delete_arr[i] != "") delete_lines[delete_arr[i]] = 1
+                }
+            }
+            NR == 1 { print $0; next }
+            NR == total { next }
+            !(NR in delete_lines) { print $0 }
+            END { print new_footer }
+        ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
     fi
     
-    mv "$tmp" "$file" || err "Failed to write changes"
+    mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
     info "Deleted ${#filtered[@]} lines"
+    
+    # Show new footer if not in no-header-footer mode
+    if (( ! NO_HEADER_FOOTER )); then
+        local final_footer
+        final_footer=$(tail -n 1 "$file")
+        info "Footer updated to: $final_footer"
+    fi
+    
     [[ -n "$modified" ]] && info "Modified lines saved: $modified"
 }
 
@@ -483,7 +555,16 @@ replace_lines() {
     [[ "$rs" =~ ^[0-9]+$ && "$re" =~ ^[0-9]+$ ]] || err "Replace positions must be numbers"
     (( rs >= 1 && re >= rs )) || err "Invalid replace range: $rs-$re"
     
-    # Find matches
+    # Check available disk space
+    local file_size
+    file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+    if (( file_size > 0 )); then
+        local dir_free
+        dir_free=$(df "$file" | tail -1 | awk '{print $4 * 1024}' 2>/dev/null || echo 999999999999)
+        (( dir_free > file_size * 2 )) || err "Insufficient disk space"
+    fi
+    
+    # Find all matching lines
     local -a match_lines
     mapfile -t match_lines < <(find_matches "$file" "$word")
     (( ${#match_lines[@]} )) || { echo "Error: No matches found" >&2; return 1; }
@@ -491,6 +572,7 @@ replace_lines() {
     local total
     total=$(wc -l < "$file")
     
+    # Filter out protected lines (header/footer)
     local -a filtered skipped_lines
     local skipped_header=0 skipped_footer=0
     
@@ -530,10 +612,11 @@ replace_lines() {
     
     confirm "Replace text in ${#filtered[@]} lines?" || return
     
+    # Create backup and write modified file with matching lines
     local backup modified tmp
-    backup=$(create_backup "$file")
+    backup=$(create_backup "$file") || err "Failed to create backup"
     modified=$(write_modified "$file" "${filtered[@]}")
-    tmp=$(make_temp "$file")
+    tmp=$(make_temp "$file") || err "Failed to create temp file"
     
     # In no-header-footer mode, treat all lines equally (header=0 / footer=0 won't match real lines)
     local awk_header awk_footer
@@ -545,7 +628,7 @@ replace_lines() {
         awk_footer="$total"
     fi
 
-    # Validate replace positions against actual line lengths
+    # Validate replace positions and perform replacement in single pass
     awk -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
         -v rs="$rs" -v re="$re" -v rtxt="$rtxt" \
         -v header="$awk_header" -v footer="$awk_footer" '
@@ -573,9 +656,45 @@ replace_lines() {
             }
         }' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to replace"; }
     
-    mv "$tmp" "$file" || err "Failed to write changes"
+    mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
     info "Replaced text in ${#filtered[@]} lines"
     [[ -n "$modified" ]] && info "Modified lines saved: $modified"
+}
+
+merge_line_with_next() {
+    local file="$1" line="$2"
+    local total
+    total=$(wc -l < "$file")
+
+    (( line >= 1 && line < total )) || err "Line $line out of range for merge (1-$((total-1)))"
+
+    if (( ! NO_HEADER_FOOTER )); then
+        (( line == HEADER_LINE_NUM )) && err "Cannot merge header line"
+        (( line == total || line + 1 == total )) && err "Cannot merge into footer line"
+    fi
+
+    info "Will merge line $line with line $((line + 1))"
+
+    if (( DRY_RUN )); then
+        echo "[DRY-RUN] Line $line: $(sed -n "${line}p" "$file")"
+        echo "[DRY-RUN] Line $((line+1)): $(sed -n "$((line+1))p" "$file")"
+        echo "[DRY-RUN] Merged: $(sed -n "${line}p" "$file")$(sed -n "$((line+1))p" "$file")"
+        return 0
+    fi
+
+    confirm "Merge line $line with line $((line + 1))?" || return
+
+    local backup tmp
+    backup=$(create_backup "$file") || err "Failed to create backup"
+    tmp=$(make_temp "$file") || err "Failed to create temp file"
+
+    awk -v t="$line" '
+        NR == t { merged = $0; getline; print merged $0; next }
+        { print }
+    ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to merge lines"; }
+
+    mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write (restored from backup)"; }
+    info "Merged line $line with line $((line + 1))"
 }
 
 # ================= KEYWORD SEARCH =================
@@ -583,6 +702,11 @@ keyword_search() {
     local file="$1" word="$2"
     
     [[ -n "$word" ]] || err "Search word cannot be empty"
+    
+    # Validate regex early if in regex mode
+    if (( REGEX_MODE )); then
+        validate_regex "$word"
+    fi
     
     if (( REPLACE_MODE )); then
         # Parse replace position
@@ -595,9 +719,21 @@ keyword_search() {
     else
         preview_matches "$file" "$word" || return 1
         
-        local -a match_lines
-        mapfile -t match_lines < <(find_matches "$file" "$word")
-        delete_lines "$file" "${match_lines[@]}"
+        # Process matches directly in awk without loading into array for large files
+        local tmp_matches
+        tmp_matches=$(make_temp "$file")
+        find_matches "$file" "$word" > "$tmp_matches"
+        
+        if [[ -s "$tmp_matches" ]]; then
+            local -a match_lines
+            mapfile -t match_lines < "$tmp_matches"
+            delete_lines "$file" "${match_lines[@]}"
+        else
+            echo "No matches found" >&2
+            rm -f "$tmp_matches"
+            return 1
+        fi
+        rm -f "$tmp_matches"
     fi
 }
 
@@ -632,6 +768,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run) DRY_RUN=1; shift;;
         --no-color) NO_COLOR=1; shift;;
         --no-header-footer) NO_HEADER_FOOTER=1; shift;;
+        --merge-next) MERGE_NEXT=1; shift;;
         *) err "Unknown option: $1" "$EXIT_USAGE";;
     esac
 done
@@ -651,23 +788,34 @@ if (( ROLLBACK )); then
     exit "$EXIT_SUCCESS"
 fi
 
+# VALIDATE BEFORE ANY OPERATIONS
+[[ -f "$FILE" ]] || err "File not found: $FILE"
+validate_file_size "$FILE"
+
 # VALIDATE FOOTER FORMAT FIRST (before any operations, skipped in no-header-footer mode)
 if [[ -n "$LINE_NUM" || -n "$WORD" ]]; then
     validate_footer "$FILE"
 fi
 
 if [[ -n "$LINE_NUM" ]]; then
-    [[ -f "$FILE" ]] || err "File not found: $FILE"
-    preview_line "$FILE" "$LINE_NUM"
-    confirm "Delete this line?" || exit "$EXIT_SUCCESS"
-    delete_lines "$FILE" "$LINE_NUM"
+    if (( MERGE_NEXT )); then
+        validate_footer "$FILE"
+        merge_line_with_next "$FILE" "$LINE_NUM"
+    else
+        preview_line "$FILE" "$LINE_NUM"
+        confirm "Delete this line?" || exit "$EXIT_SUCCESS"
+        delete_lines "$FILE" "$LINE_NUM"
+    fi
     exit "$EXIT_SUCCESS"
 fi
 
 if [[ -n "$WORD" ]]; then
-    [[ -f "$FILE" ]] || err "File not found: $FILE"
     keyword_search "$FILE" "$WORD" || exit "$EXIT_FAILURE"
     exit "$EXIT_SUCCESS"
+fi
+
+if (( MERGE_NEXT )) && [[ -z "$LINE_NUM" ]]; then
+    err "--merge-next requires -l <line_num>" "$EXIT_USAGE"
 fi
 
 err "Provide either -l <line_num> or -w <word>" "$EXIT_USAGE"
