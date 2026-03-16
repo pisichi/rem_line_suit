@@ -2,7 +2,6 @@
 set -euo pipefail
 
 # ================= EXIT CODES =================
-# All exit paths use these constants. See --help for user-facing summary.
 EXIT_SUCCESS=0
 EXIT_FAILURE=1
 EXIT_USAGE=2
@@ -22,34 +21,45 @@ DRY_RUN=0
 NO_COLOR=0
 NO_HEADER_FOOTER=0
 MERGE_NEXT=0
+NO_MODIFIED=0
 DEFAULT_FILE="./data.txt"
 
-# Search/Replace settings
 POS_START=""
 POS_END=""
 REPLACE_MODE=0
 REPLACE_POS=""
 REPLACE_TXT=""
 
-# File settings
 FILE=""
 LINE_NUM=""
 WORD=""
 ROLLBACK=0
 
-# Header/Footer
 HEADER_LINE_NUM=1
 FOOTER_PATTERN="^FOOTERTEST[0-9]+$"
 FOOTER_PREFIX="FOOTERTEST"
 FOOTER_NUM_FORMAT="%08d"
 
+# Runtime caches — set by validate_footer, consumed by downstream functions
+CACHED_TOTAL=""
+CACHED_FOOTER_NUM=""
+
+# ================= ALLOWED PATHS =================
+# Hardcoded list of directory prefixes that -f is permitted to target.
+# Add one entry per allowed directory. Paths are resolved to their real
+# absolute form (symlinks expanded) before checking, so symlink tricks
+# cannot bypass the allowlist.
+# Leave the array empty to disable the check entirely (allow any path).
+ALLOWED_PATHS=(
+    # "/data/files"
+    # "/mnt/batch"
+    # "/home/user/workspace"
+)""
+
 # ================= AWK / LOCALE SETUP =================
-# gawk with C.UTF-8 gives true character-aware substr/length/index,
-# so --pos counts Unicode characters, not bytes.
+# gawk + C.UTF-8 gives true character-aware substr/length/index for --pos.
 # mawk (Ubuntu default) is always byte-based regardless of locale;
-# line operations (search, delete, replace by keyword) still work
-# correctly on UTF-8 content since byte-pattern matching finds the
-# right byte sequences. Only --pos will be byte-based with mawk.
+# line operations still work correctly on UTF-8 content.
 if command -v gawk &>/dev/null; then
     AWK_CMD=gawk
     export LC_ALL=C.UTF-8
@@ -68,13 +78,13 @@ cleanup_temp() {
         [[ -f "$f" ]] && rm -f "$f"
     done
 }
-
 trap cleanup_temp EXIT INT TERM
 
 make_temp() {
-    local file="$1"
-    local dir=$(dirname "$file")
-    local tmp=$(mktemp -p "$dir" ".tmp.XXXXXXXXXX") || err "Cannot create temp file in $dir"
+    local dir
+    dir=$(dirname "$1")
+    local tmp
+    tmp=$(mktemp -p "$dir" ".tmp.XXXXXXXXXX") || err "Cannot create temp file in $dir"
     TEMP_FILES+=("$tmp")
     echo "$tmp"
 }
@@ -82,26 +92,52 @@ make_temp() {
 # ================= REGEX SAFETY =================
 validate_regex() {
     local pattern="$1"
-    # Quick timeout test on first 100 lines to catch catastrophic backtracking
-    timeout 2s $AWK_CMD "BEGIN { if (match(\"test\", \"$pattern\")) print \"ok\" }" 2>/dev/null || err "Regex pattern is invalid or too slow (potential ReDoS): $pattern"
+    timeout 2s awk "BEGIN { if (match(\"test\", \"$pattern\")) print \"ok\" }" 2>/dev/null \
+        || err "Regex pattern is invalid or too slow (potential ReDoS): $pattern"
 }
 
 # ================= LARGE FILE HANDLING =================
 validate_file_size() {
     local file="$1"
-    local max_size=$((50 * 1024 * 1024 * 1024))  # 50GB warning
+    local max_size=$(( 50 * 1024 * 1024 * 1024 ))
     local size
-
     size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
-
     if (( size > max_size )); then
         info "WARNING: File is very large ($(( size / 1024 / 1024 / 1024 ))GB). Operations may take a while." >&2
     fi
 }
 
+# ================= PATH ALLOWLIST =================
+validate_allowed_path() {
+    local file="$1"
+
+    # If the allowlist is empty, all paths are permitted
+    if (( ${#ALLOWED_PATHS[@]} == 0 )); then
+        return 0
+    fi
+
+    # Resolve to real absolute path — defeats symlink traversal attempts
+    local real_path
+    real_path=$(realpath -m "$file" 2>/dev/null || readlink -f "$file" 2>/dev/null || echo "$file")
+    local real_dir
+    real_dir=$(dirname "$real_path")
+
+    for allowed in "${ALLOWED_PATHS[@]}"; do
+        # Resolve the allowed prefix too, for consistency
+        local real_allowed
+        real_allowed=$(realpath -m "$allowed" 2>/dev/null || readlink -f "$allowed" 2>/dev/null || echo "$allowed")
+        # Match if the file's directory starts with the allowed prefix
+        if [[ "$real_dir" == "$real_allowed" || "$real_dir" == "$real_allowed/"* ]]; then
+            return 0
+        fi
+    done
+
+    err "Path not allowed: $real_path
+  Permitted directories:$(printf '
+    %s' "${ALLOWED_PATHS[@]}")" "$EXIT_USAGE"
+}
+
 # ================= UTILITIES =================
-# Usage: err "message" [exit_code]
-# Default exit_code is EXIT_FAILURE. Use EXIT_USAGE for bad arguments.
 err() {
     local msg="$1"
     local code="${2:-$EXIT_FAILURE}"
@@ -137,39 +173,27 @@ CONTROL OPTIONS:
   --merge-next             Merge the target line (-l) with the line below it.
                            Useful for fixing records split across two lines.
                            Requires -l. Cannot be used with -w.
+                           Footer is NOT updated (merge repairs corruption,
+                           it does not remove a logical record).
   --no-header-footer       Disable header/footer protection and footer tracking.
-                           Use this for plain files without a structured header/footer.
   --yes                    Skip all confirmation prompts
   --dry-run                Show what would happen without making changes
   --no-color               Disable colored output
+  --no-modified            Skip saving deleted/replaced lines to a
+                           _modified_* file. Eliminates an extra full-file
+                           scan — recommended for large files where you
+                           don't need the audit trail.
   --force                  (Reserved for future use)
 
 EXAMPLES:
-  # Delete line 5
   script.sh -l 5
-
-  # Merge a split line: join line 9 with line 10
   script.sh -l 9 --merge-next
-
-  # Dry run merge to preview result
   script.sh -l 9 --merge-next --dry-run
-
-  # Search and delete lines containing "error"
   script.sh -w "error"
-
-  # Search with regex and delete
   script.sh -w "^ERROR.*" --regex
-
-  # Replace text in matching lines
   script.sh -w "foo" --replace-pos 1-3 --replace-txt "bar"
-
-  # Dry run to preview changes
   script.sh -w "test" --dry-run
-
-  # Restore from backup
   script.sh --rollback
-
-  # Operate on a plain file without header/footer
   script.sh -f plain.txt -w "old" --replace-pos 1-3 --replace-txt "new" --no-header-footer
 
 NOTES:
@@ -178,6 +202,7 @@ NOTES:
   - Use --no-header-footer for plain files that lack this structure
   - Backups are created automatically as: <filename>_backup
   - Temp files are created in the same directory as the source file
+  - Install gawk for character-accurate --pos with UTF-8/multibyte content
 
 EXIT CODES:
   0  Success (or user declined confirmation)
@@ -199,9 +224,10 @@ confirm() {
 }
 
 # ================= FOOTER VALIDATION =================
+# Both functions echo the total line count so callers can cache it in
+# CACHED_TOTAL and avoid redundant wc -l scans on large files.
 validate_file() {
     local file="$1"
-
     [[ -f "$file" ]] || err "File not found: $file"
     [[ -r "$file" ]] || err "File not readable: $file"
 
@@ -213,41 +239,62 @@ validate_file() {
     else
         (( total >= 2 )) || err "File must have at least 2 lines (header + footer), found $total"
     fi
+
+    echo "$total"
 }
 
 validate_footer() {
     local file="$1"
 
-    # Skip all footer/header validation in no-header-footer mode
     if (( NO_HEADER_FOOTER )); then
         validate_file "$file"
         return 0
     fi
 
-    validate_file "$file"
+    local total
+    total=$(validate_file "$file")
 
     local footer
     footer=$(tail -n 1 "$file" | tr -d '[:space:]')
-    [[ "$footer" =~ $FOOTER_PATTERN ]] || err "Invalid footer format: $footer (expected pattern: ${FOOTER_PREFIX}########)"
+    [[ "$footer" =~ $FOOTER_PATTERN ]] \
+        || err "Invalid footer format: $footer (expected pattern: ${FOOTER_PREFIX}########)"
+
+    # Cache numeric footer value — compute_footer uses this to skip tail -n 1
+    CACHED_FOOTER_NUM=${footer#$FOOTER_PREFIX}
 
     info "Footer validation passed: $footer" >&2
+    echo "$total"
 }
 
 # ================= BACKUP MANAGEMENT =================
-get_backup_name() {
-    local file="$1"
-    echo "${file}_backup"
-}
+get_backup_name() { echo "${1}_backup"; }
 
 create_backup() {
     local file="$1"
     local backup
     backup=$(get_backup_name "$file")
 
-    # Only create if doesn't exist
     if [[ -f "$backup" ]]; then
-        info "WARNING: Using existing backup: $backup" >&2
-        info "Previous backup will NOT be overwritten" >&2
+        local src_size backup_size
+        src_size=$(stat -c%s "$file"   2>/dev/null || stat -f%z "$file"   2>/dev/null || echo 0)
+        backup_size=$(stat -c%s "$backup" 2>/dev/null || stat -f%z "$backup" 2>/dev/null || echo 0)
+
+        if (( src_size > backup_size )); then
+            # Backup is smaller than the current file — likely a failed/partial
+            # write from a previous run. Overwrite it with the current file.
+            info "WARNING: Existing backup is smaller than current file (backup: ${backup_size}B, current: ${src_size}B)" >&2
+            info "Replacing incomplete backup: $backup" >&2
+            if (( DRY_RUN )); then
+                info "[DRY-RUN] Would replace incomplete backup: $backup" >&2
+            else
+                cp -p "$file" "$backup" || { echo "abort"; return 1; }
+                info "Backup replaced: $backup" >&2
+            fi
+        else
+            # Backup is same size or larger — it was created from a bigger file,
+            # which is the normal state after lines have been deleted.
+            info "Using existing backup: $backup" >&2
+        fi
     else
         if (( DRY_RUN )); then
             info "[DRY-RUN] Would create backup: $backup" >&2
@@ -263,16 +310,14 @@ rollback_file() {
     local file="$1"
     local backup
     backup=$(get_backup_name "$file")
-
     [[ -f "$backup" ]] || err "Backup file not found: $backup"
 
-    # Only validate footer on rollback when not in no-header-footer mode
     if (( ! NO_HEADER_FOOTER )); then
-        validate_footer "$backup"
+        validate_footer "$backup" > /dev/null
     fi
 
-    info "Current file lines: $(wc -l < "$file")"
-    info "Backup file lines: $(wc -l < "$backup")"
+    info "Current file size: $(du -h "$file"  | cut -f1)"
+    info "Backup file size:  $(du -h "$backup" | cut -f1)"
 
     (( DRY_RUN )) && { info "[DRY-RUN] Would restore from: $backup"; return; }
 
@@ -285,104 +330,50 @@ rollback_file() {
 # ================= FOOTER OPERATIONS =================
 compute_footer() {
     local file="$1" deleted="$2"
-    local footer num new
+    local num new
 
-    footer=$(tail -n 1 "$file" | tr -d '[:space:]')
-    [[ "$footer" =~ $FOOTER_PATTERN ]] || err "Invalid footer: $footer"
+    # Use value cached by validate_footer — skips another tail -n 1 scan.
+    # Falls back to reading the file only if cache is empty (e.g. rollback).
+    if [[ -n "${CACHED_FOOTER_NUM:-}" ]]; then
+        num="$CACHED_FOOTER_NUM"
+        CACHED_FOOTER_NUM=""
+    else
+        local footer
+        footer=$(tail -n 1 "$file" | tr -d '[:space:]')
+        [[ "$footer" =~ $FOOTER_PATTERN ]] || err "Invalid footer: $footer"
+        num=${footer#$FOOTER_PREFIX}
+    fi
 
-    num=${footer#$FOOTER_PREFIX}
-    new=$((10#$num - deleted))
-    (( new < 0 )) && err "Footer would be negative: $num - $deleted = $new"
-
+    new=$(( 10#$num - deleted ))
+    (( new >= 0 )) || err "Footer would be negative: $num - $deleted = $new"
     printf "${FOOTER_PREFIX}${FOOTER_NUM_FORMAT}" "$new"
 }
 
 # ================= PREVIEW FUNCTIONS =================
 preview_line() {
-    local file="$1" line="$2" total
-    total=$(wc -l < "$file")
+    local file="$1" line="$2"
+    # Reuse CACHED_TOTAL — do not consume it; delete_lines still needs it
+    local total="${CACHED_TOTAL:-$(wc -l < "$file")}"
 
-    (( line < 1 || line > total )) && err "Line $line out of range (1-$total)"
+    (( line >= 1 && line <= total )) || err "Line $line out of range (1-$total)"
 
-    # Warn if trying to preview protected lines (only in header/footer mode)
     if (( ! NO_HEADER_FOOTER )); then
-        if (( line == HEADER_LINE_NUM )); then
-            info "WARNING: Line $line is the HEADER (protected)" >&2
-        elif (( line == total )); then
-            info "WARNING: Line $line is the FOOTER (protected)" >&2
-        fi
+        (( line == HEADER_LINE_NUM )) && info "WARNING: Line $line is the HEADER (protected)" >&2
+        (( line == total ))           && info "WARNING: Line $line is the FOOTER (protected)" >&2
     fi
 
-    local start=$((line > 1 ? line - 1 : 1))
-    local end=$((line < total ? line + 1 : total))
+    local start=$(( line > 1 ? line - 1 : 1 ))
+    local end=$(( line < total ? line + 1 : total ))
 
     echo "Preview:"
     $AWK_CMD -v s="$start" -v t="$line" -v e="$end" \
-        -v R="$RED" -v Y="$YELLOW" -v X="$RESET" \
-        -v nc="$NO_COLOR" '
+        -v R="$RED" -v Y="$YELLOW" -v X="$RESET" -v nc="$NO_COLOR" '
         NR >= s && NR <= e {
             prefix = (nc ? "" : (NR == t ? R : Y))
             suffix = (nc ? "" : X)
             printf "%s%5d | %s%s\n", prefix, NR, $0, suffix
-        }' "$file"
-}
-
-preview_matches() {
-    local file="$1" word="$2"
-
-    echo "Matches (up to $PREVIEW_LIMIT):"
-    $AWK_CMD -v w="$word" -v limit="$PREVIEW_LIMIT" \
-        -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
-        -v R="$RED" -v X="$RESET" -v nc="$NO_COLOR" '
-        BEGIN { shown=0 }
-        {
-            seg = (s && e) ? substr($0, s, e - s + 1) : $0
-            matched = regex ? match(seg, w) : index(seg, w)
-
-            if (matched) {
-                shown++
-                if (shown <= limit) {
-                    if (nc) {
-                        printf "%d:%s\n", NR, $0
-                    } else {
-                        if (s && e) {
-                            # Highlight only within the --pos segment, leave the rest plain
-                            before  = substr($0, 1, s - 1)
-                            segment = substr($0, s, e - s + 1)
-                            after   = substr($0, e + 1)
-                            if (regex) {
-                                gsub(w, R "&" X, segment)
-                            } else {
-                                escaped = w
-                                gsub(/[[\\.^$*+?{}()|]/, "\\\\&", escaped)
-                                gsub(escaped, R w X, segment)
-                            }
-                            line = before segment after
-                        } else {
-                            line = $0
-                            if (regex) {
-                                gsub(w, R "&" X, line)
-                            } else {
-                                # Escape special regex chars for literal replacement
-                                escaped = w
-                                gsub(/[[\\.^$*+?{}()|]/, "\\\\&", escaped)
-                                gsub(escaped, R w X, line)
-                            }
-                        }
-                        printf "%d:%s\n", NR, line
-                    }
-                }
-                # Exit early after reaching limit to avoid scanning entire file
-                if (shown > limit) {
-                    print "... +" (shown - limit) " more"
-                    exit 0
-                }
-            }
         }
-        END {
-            if (shown == 0) print "No matches found"
-            exit (shown == 0 ? 1 : 0)
-        }' "$file"
+        NR > e { exit }' "$file"
 }
 
 preview_replacements() {
@@ -393,74 +384,69 @@ preview_replacements() {
         -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
         -v rs="$rs" -v re="$re" -v rtxt="$rtxt" \
         -v R="$RED" -v G="$GREEN" -v Y="$YELLOW" -v X="$RESET" -v nc="$NO_COLOR" '
-        BEGIN { shown=0 }
+        BEGIN { shown = 0 }
         {
             seg = (s && e) ? substr($0, s, e - s + 1) : $0
             matched = regex ? match(seg, w) : index(seg, w)
-
-            if (matched) {
-                shown++
-                if (shown <= limit) {
-                    before = substr($0, 1, rs - 1)
-                    after = substr($0, re + 1)
-                    new_line = before rtxt after
-
-                    if (nc) {
-                        printf "Original %d: %s\n", NR, $0
-                        printf "Replaced %d: %s\n\n", NR, new_line
-                    } else {
-                        printf "%sOriginal %d:%s %s%s\n", Y, NR, X, R, $0
-                        printf "%sReplaced %d:%s %s%s\n\n", Y, NR, X, G, new_line
-                    }
-                }
-                # Exit early after reaching limit to avoid scanning entire file
-                if (shown > limit) {
-                    print "... +" (shown - limit) " more"
-                    exit 0
+            if (!matched) next
+            shown++
+            if (shown <= limit) {
+                new_line = substr($0, 1, rs-1) rtxt substr($0, re+1)
+                if (nc) {
+                    print "Original " NR ": " $0
+                    print "Replaced " NR ": " new_line
+                    print ""
+                } else {
+                    print Y "Original " NR ":" X " " R $0 X
+                    print Y "Replaced " NR ":" X " " G new_line X
+                    print ""
                 }
             }
+            if (shown > limit) { print "... +" (shown - limit) " more"; exit }
         }
-        END {
-            if (shown == 0) print "No matches found"
-            exit (shown == 0 ? 1 : 0)
-        }' "$file"
+        END { if (shown == 0) { print "No matches found"; exit 1 } }' "$file"
 }
 
 # ================= FIND MATCHING LINES =================
 find_matches() {
     local file="$1" word="$2"
-
     $AWK_CMD -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" '
         {
             seg = (s && e) ? substr($0, s, e - s + 1) : $0
-            matched = regex ? match(seg, w) : index(seg, w)
-            if (matched) print NR
+            if (regex ? match(seg, w) : index(seg, w)) print NR
         }' "$file"
 }
 
 # ================= WRITE MODIFIED LINES =================
+# Saves the original content of the given line numbers to a timestamped file.
+# Single awk pass with early exit after the highest needed line number.
 write_modified() {
-    local file="$1"
-    shift
+    local file="$1"; shift
     local lines=("$@")
     local out="${file}_modified_$(date +%Y%m%d%H%M%S)"
 
-    if (( DRY_RUN )); then
-        echo ""
-        return
-    fi
+    (( DRY_RUN )) && { echo ""; return; }
 
-    > "$out" || err "Cannot create modified file: $out"
-    for line in "${lines[@]}"; do
-        sed -n "${line}p" "$file" >> "$out"
-    done
+    local max_line=0
+    for l in "${lines[@]}"; do (( l > max_line )) && max_line=$l; done
+
+    local lf
+    lf=$(make_temp "$file")
+    printf '%s\n' "${lines[@]}" > "$lf"
+
+    $AWK_CMD -v max_line="$max_line" -v lf="$lf" '
+        BEGIN { while ((getline ln < lf) > 0) save[ln] = 1 }
+        NR in save { print }
+        NR == max_line { exit }
+    ' "$file" > "$out" || err "Cannot write modified file: $out"
+
+    rm -f "$lf"
     echo "$out"
 }
 
 # ================= DELETE LINES =================
 delete_lines() {
-    local file="$1"
-    shift
+    local file="$1"; shift
     local lines=("$@")
 
     [[ -f "$file" ]] || err "File not found: $file"
@@ -468,56 +454,45 @@ delete_lines() {
     [[ -w "$file" ]] || err "File not writable: $file"
     (( ${#lines[@]} )) || err "No lines to delete"
 
-    # Check available disk space (need 2x file size for backup + temp)
     local file_size
     file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
     if (( file_size > 0 )); then
         local dir_free
         dir_free=$(df "$file" | tail -1 | awk '{print $4 * 1024}' 2>/dev/null || echo 999999999999)
-        (( dir_free > file_size * 2 )) || err "Insufficient disk space. Need $(( file_size * 2 / 1024 / 1024 ))MB, have $(( dir_free / 1024 / 1024 ))MB"
+        (( dir_free > file_size * 2 )) \
+            || err "Insufficient disk space. Need $(( file_size * 2 / 1024 / 1024 ))MB, have $(( dir_free / 1024 / 1024 ))MB"
     fi
 
-    # Deduplicate and sort using temp file for large arrays
     local tmp_sort
     tmp_sort=$(make_temp "$file")
-    printf "%s\n" "${lines[@]}" | sort -n -u > "$tmp_sort"
-    local uniq
+    printf '%s\n' "${lines[@]}" | sort -n -u > "$tmp_sort"
+    local -a uniq
     mapfile -t uniq < "$tmp_sort"
     rm -f "$tmp_sort"
 
-    local total
-    total="${CACHED_TOTAL:-$(wc -l < "$file")}"
-    CACHED_TOTAL=""   # consume — avoid redundant scan
+    # Reuse total from validate_footer — avoids a redundant wc -l scan
+    local total="${CACHED_TOTAL:-$(wc -l < "$file")}"
+    CACHED_TOTAL=""
 
-    # Filter out header and footer (only in normal mode), track what was skipped
     local -a filtered skipped_lines
     local skipped_header=0 skipped_footer=0
 
     for L in "${uniq[@]}"; do
         [[ "$L" =~ ^[0-9]+$ ]] || err "Invalid line number: $L"
         (( L >= 1 && L <= total )) || err "Line $L out of range (1-$total)"
-
         if (( ! NO_HEADER_FOOTER )); then
-            if (( L == HEADER_LINE_NUM )); then
-                skipped_header=1
-                skipped_lines+=("$L (header)")
-            elif (( L == total )); then
-                skipped_footer=1
-                skipped_lines+=("$L (footer)")
-            else
-                filtered+=("$L")
+            if   (( L == HEADER_LINE_NUM )); then skipped_header=1; skipped_lines+=("$L (header)")
+            elif (( L == total           )); then skipped_footer=1; skipped_lines+=("$L (footer)")
+            else filtered+=("$L")
             fi
         else
             filtered+=("$L")
         fi
     done
 
-    # Inform user about skipped lines
-    if (( skipped_header || skipped_footer )); then
-        info "Skipped protected lines: ${skipped_lines[*]}"
-    fi
+    (( skipped_header || skipped_footer )) \
+        && info "Skipped protected lines: ${skipped_lines[*]}"
 
-    # Check if there are any lines left to delete
     if (( ${#filtered[@]} == 0 )); then
         info "No lines to delete after filtering protected lines"
         return 0
@@ -526,61 +501,52 @@ delete_lines() {
     info "Will delete ${#filtered[@]} line(s)"
 
     if (( DRY_RUN )); then
-        if (( ! NO_HEADER_FOOTER )); then
-            info "[DRY-RUN] New footer: $(compute_footer "$file" "${#filtered[@]}")"
-        fi
+        (( ! NO_HEADER_FOOTER )) \
+            && info "[DRY-RUN] New footer: $(compute_footer "$file" "${#filtered[@]}")"
         return 0
     fi
 
     confirm "Delete these lines?" || return
 
-    # Create backup and write modified AFTER filtering
     local backup modified tmp
     backup=$(create_backup "$file") || err "Failed to create backup"
-    modified=$(write_modified "$file" "${filtered[@]}")
+    modified=$( (( NO_MODIFIED )) && echo "" || write_modified "$file" "${filtered[@]}" )
     tmp=$(make_temp "$file") || err "Failed to create temp file"
 
+    # Pass line numbers via temp file — avoids mawk -v multiline quoting issues
+    local lf
+    lf=$(make_temp "$file")
+    printf '%s\n' "${filtered[@]}" > "$lf"
+
+    info "Processing..." >&2
+
     if (( NO_HEADER_FOOTER )); then
-        # Simple delete: use $AWK_CMD for efficiency with large files (avoids massive sed commands)
-        $AWK_CMD -v lines_str="$(printf '%s\n' "${filtered[@]}")" '
-            BEGIN {
-                split(lines_str, delete_arr, "\n")
-                for (i in delete_arr) {
-                    if (delete_arr[i] != "") delete_lines[delete_arr[i]] = 1
-                }
-            }
-            !(NR in delete_lines)
-        ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+        $AWK_CMD -v lf="$lf" '
+            BEGIN { while ((getline ln < lf) > 0) del[ln] = 1 }
+            !(NR in del)
+        ' "$file" > "$tmp" \
+            || { rm -f "$tmp" "$lf"; err "Failed to build new file"; }
     else
         local new_footer
-        new_footer=$(compute_footer "$file" "${#filtered[@]}") || { rm -f "$tmp"; err "Failed to compute footer"; }
+        new_footer=$(compute_footer "$file" "${#filtered[@]}") \
+            || { rm -f "$tmp" "$lf"; err "Failed to compute footer"; }
 
-        # Use $AWK_CMD to avoid massive sed commands that fail on large files
-        $AWK_CMD -v lines_str="$(printf '%s\n' "${filtered[@]}")" -v new_footer="$new_footer" \
-            -v total="$total" '
-            BEGIN {
-                split(lines_str, delete_arr, "\n")
-                for (i in delete_arr) {
-                    if (delete_arr[i] != "") delete_lines[delete_arr[i]] = 1
-                }
-            }
-            NR == 1 { print $0; next }
+        $AWK_CMD -v lf="$lf" -v new_footer="$new_footer" -v total="$total" '
+            BEGIN { while ((getline ln < lf) > 0) del[ln] = 1 }
+            NR == 1     { print; next }
             NR == total { next }
-            !(NR in delete_lines) { print $0 }
+            !(NR in del) { print }
             END { print new_footer }
-        ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to build new file"; }
+        ' "$file" > "$tmp" \
+            || { rm -f "$tmp" "$lf"; err "Failed to build new file"; }
     fi
 
-    mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
+    rm -f "$lf"
+    mv "$tmp" "$file" \
+        || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
+
     info "Deleted ${#filtered[@]} lines"
-
-    # Show new footer if not in no-header-footer mode
-    if (( ! NO_HEADER_FOOTER )); then
-        local final_footer
-        final_footer=$(tail -n 1 "$file")
-        info "Footer updated to: $final_footer"
-    fi
-
+    (( ! NO_HEADER_FOOTER )) && info "Footer updated to: $new_footer"
     [[ -n "$modified" ]] && info "Modified lines saved: $modified"
 }
 
@@ -592,11 +558,9 @@ replace_lines() {
     [[ -r "$file" ]] || err "File not readable: $file"
     [[ -w "$file" ]] || err "File not writable: $file"
 
-    # Validate replace positions
     [[ "$rs" =~ ^[0-9]+$ && "$re" =~ ^[0-9]+$ ]] || err "Replace positions must be numbers"
     (( rs >= 1 && re >= rs )) || err "Invalid replace range: $rs-$re"
 
-    # Check available disk space
     local file_size
     file_size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
     if (( file_size > 0 )); then
@@ -605,134 +569,117 @@ replace_lines() {
         (( dir_free > file_size * 2 )) || err "Insufficient disk space"
     fi
 
-    # Find all matching lines
-    local -a match_lines
-    mapfile -t match_lines < <(find_matches "$file" "$word")
-    (( ${#match_lines[@]} )) || { echo "Error: No matches found" >&2; return 1; }
+    local total="${CACHED_TOTAL:-$(wc -l < "$file")}"
+    CACHED_TOTAL=""
 
-    local total
-    total="${CACHED_TOTAL:-$(wc -l < "$file")}"
-    CACHED_TOTAL=""   # consume — avoid redundant scan
-
-    # Filter out protected lines (header/footer)
-    local -a filtered skipped_lines
-    local skipped_header=0 skipped_footer=0
-
-    for L in "${match_lines[@]}"; do
-        if (( ! NO_HEADER_FOOTER )); then
-            if (( L == HEADER_LINE_NUM )); then
-                skipped_header=1
-                skipped_lines+=("$L (header)")
-            elif (( L == total )); then
-                skipped_footer=1
-                skipped_lines+=("$L (footer)")
-            else
-                filtered+=("$L")
-            fi
-        else
-            filtered+=("$L")
-        fi
-    done
-
-    # Inform user about skipped lines
-    if (( skipped_header || skipped_footer )); then
-        info "Skipped protected lines: ${skipped_lines[*]}"
-    fi
-
-    # Check if there are any lines left to replace
-    if (( ${#filtered[@]} == 0 )); then
-        info "No lines to replace after filtering protected lines"
-        return 0
-    fi
-
-    info "Found ${#filtered[@]} lines to replace"
-
-    if (( DRY_RUN )); then
-        info "[DRY-RUN] Would replace text in ${#filtered[@]} lines"
-        return 0
-    fi
-
-    confirm "Replace text in ${#filtered[@]} lines?" || return
-
-    # Create backup and write modified file with matching lines
-    local backup modified tmp
-    backup=$(create_backup "$file") || err "Failed to create backup"
-    modified=$(write_modified "$file" "${filtered[@]}")
-    tmp=$(make_temp "$file") || err "Failed to create temp file"
-
-    # In no-header-footer mode, treat all lines equally (header=0 / footer=0 won't match real lines)
     local awk_header awk_footer
     if (( NO_HEADER_FOOTER )); then
-        awk_header=0
-        awk_footer=0
+        awk_header=0; awk_footer=0
     else
-        awk_header="$HEADER_LINE_NUM"
-        awk_footer="$total"
+        awk_header="$HEADER_LINE_NUM"; awk_footer="$total"
     fi
 
-    # Validate replace positions and perform replacement in single pass
-    $AWK_CMD -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
-        -v rs="$rs" -v re="$re" -v rtxt="$rtxt" \
-        -v header="$awk_header" -v footer="$awk_footer" '
-        {
-            # Skip header and footer (skipped when header/footer == 0 since NR starts at 1)
-            if ((header != 0 && NR == header) || (footer != 0 && NR == footer)) {
-                print $0
-                next
-            }
+    if (( DRY_RUN )); then
+        local dry_count
+        dry_count=$(find_matches "$file" "$word" | wc -l)
+        (( dry_count > 0 )) || { echo "No matches found" >&2; return 1; }
+        info "[DRY-RUN] Would replace text in $dry_count line(s)"
+        return 0
+    fi
 
+    # One scan to count matches before asking for confirmation
+    local match_count
+    match_count=$(find_matches "$file" "$word" | wc -l)
+    (( match_count > 0 )) || { echo "Error: No matches found" >&2; return 1; }
+
+    info "Found $match_count line(s) to replace"
+    confirm "Replace text in $match_count lines?" || return
+
+    local backup tmp
+    backup=$(create_backup "$file") || err "Failed to create backup"
+    tmp=$(make_temp "$file")        || err "Failed to create temp file"
+    local modified_out
+    if (( NO_MODIFIED )); then
+        modified_out="/dev/null"
+    else
+        modified_out="${file}_modified_$(date +%Y%m%d%H%M%S)"
+    fi
+    local cnt_file
+    cnt_file=$(make_temp "$file")
+
+    info "Processing..." >&2
+
+    # Single combined pass: replace in-place, save originals, count replacements.
+    # No second find_matches scan needed — the awk does its own matching.
+    $AWK_CMD \
+        -v w="$word"   -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
+        -v rs="$rs"    -v re="$re"        -v rtxt="$rtxt" \
+        -v header="$awk_header" -v footer="$awk_footer" \
+        -v modfile="$modified_out" -v cntfile="$cnt_file" '
+        BEGIN { replaced = 0 }
+        {
+            if ((header != 0 && NR == header) || (footer != 0 && NR == footer)) {
+                print; next
+            }
             seg = (s && e) ? substr($0, s, e - s + 1) : $0
             matched = regex ? match(seg, w) : index(seg, w)
-
             if (matched) {
                 line_len = length($0)
                 if (re > line_len) {
-                    printf "Error: Replace end position %d exceeds line %d length %d\n", re, NR, line_len > "/dev/stderr"
+                    print "Error: Replace end position " re \
+                          " exceeds line " NR " length " line_len > "/dev/stderr"
                     exit 1
                 }
-                before = substr($0, 1, rs - 1)
-                after = substr($0, re + 1)
-                print before rtxt after
+                print $0 > modfile
+                print substr($0, 1, rs-1) rtxt substr($0, re+1)
+                replaced++
             } else {
-                print $0
+                print
             }
-        }' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to replace"; }
+        }
+        END { print replaced > cntfile }
+    ' "$file" > "$tmp" \
+        || { rm -f "$tmp" "$modified_out" "$cnt_file"; err "Failed to replace"; }
 
-    mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
-    info "Replaced text in ${#filtered[@]} lines"
-    [[ -n "$modified" ]] && info "Modified lines saved: $modified"
+    local actual_replaced=0
+    [[ -s "$cnt_file" ]] && actual_replaced=$(cat "$cnt_file")
+    rm -f "$cnt_file"
+
+    mv "$tmp" "$file" \
+        || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
+
+    info "Replaced text in $actual_replaced line(s)"
+    (( ! NO_MODIFIED )) && [[ -f "$modified_out" ]] && info "Modified lines saved: $modified_out"
 }
 
 # ================= MERGE LINE WITH NEXT =================
 merge_line_with_next() {
     local file="$1" line="$2"
-    local total
-    total="${CACHED_TOTAL:-$(wc -l < "$file")}"
-    CACHED_TOTAL=""   # consume
+    local total="${CACHED_TOTAL:-$(wc -l < "$file")}"
+    CACHED_TOTAL=""
 
-    (( line >= 1 && line < total )) || err "Line $line out of range for merge (1-$((total-1)))"
+    (( line >= 1 && line < total )) \
+        || err "Line $line out of range for merge (1-$((total-1)))"
 
     if (( ! NO_HEADER_FOOTER )); then
         (( line == HEADER_LINE_NUM )) && err "Cannot merge header line"
-        (( line + 1 == total )) && err "Cannot merge: next line ($((line+1))) is the footer (protected)"
+        (( line + 1 == total )) \
+            && err "Cannot merge: next line ($((line+1))) is the footer (protected)"
     fi
 
-    # Always show merge preview (consistent with other operations)
     echo "Merge preview:"
     $AWK_CMD -v t="$line" \
         -v R="$RED" -v G="$GREEN" -v Y="$YELLOW" -v X="$RESET" -v nc="$NO_COLOR" '
         NR == t {
-            line1 = $0
-            getline
-            line2 = $0
+            l1 = $0; getline; l2 = $0
             if (nc) {
-                printf "  Line %d (kept):     %s\n", t,   line1
-                printf "  Line %d (absorbed): %s\n", t+1, line2
-                printf "  Merged result:      %s%s\n",    line1, line2
+                print "  Line " t       " (kept):     " l1
+                print "  Line " (t+1)   " (absorbed): " l2
+                print "  Merged result:      " l1 l2
             } else {
-                printf "  %sLine %d (kept):%s     %s\n", Y, t,   X, line1
-                printf "  %sLine %d (absorbed):%s %s\n", Y, t+1, X, line2
-                printf "  %sMerged result:%s      %s%s%s\n", G, X, G, line1 line2, X
+                print "  " Y "Line " t     " (kept):"     X "     " l1
+                print "  " Y "Line " (t+1) " (absorbed):" X " " l2
+                print "  " G "Merged result:" X "      " G l1 l2 X
             }
             exit
         }' "$file"
@@ -746,32 +693,32 @@ merge_line_with_next() {
 
     local backup tmp
     backup=$(create_backup "$file") || err "Failed to create backup"
-    tmp=$(make_temp "$file") || err "Failed to create temp file"
+    tmp=$(make_temp "$file")        || err "Failed to create temp file"
 
-    # Footer is intentionally NOT updated: merging repairs a corrupted split
-    # record, it does not remove a logical record from the file.
+    info "Processing..." >&2
+
+    # Footer intentionally NOT updated: merge repairs a corrupted split record.
+    # The logical record count has not changed.
     $AWK_CMD -v t="$line" '
         NR == t { merged = $0; getline; print merged $0; next }
         { print }
-    ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to merge lines"; }
+    ' "$file" > "$tmp" \
+        || { rm -f "$tmp"; err "Failed to merge lines"; }
 
-    mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write (restored from backup)"; }
+    mv "$tmp" "$file" \
+        || { cp -p "$backup" "$file"; err "Failed to write (restored from backup)"; }
+
     info "Merged line $line with line $((line + 1))"
 }
 
 # ================= KEYWORD SEARCH =================
 keyword_search() {
     local file="$1" word="$2"
-
     [[ -n "$word" ]] || err "Search word cannot be empty"
 
-    # Validate regex early if in regex mode
-    if (( REGEX_MODE )); then
-        validate_regex "$word"
-    fi
+    (( REGEX_MODE )) && validate_regex "$word"
 
     if (( REPLACE_MODE )); then
-        # Parse replace position
         local rs re
         IFS='-' read -r rs re <<< "$REPLACE_POS"
         [[ -n "$rs" && -n "$re" ]] || err "--replace-pos format: start-end" "$EXIT_USAGE"
@@ -779,62 +726,104 @@ keyword_search() {
         preview_replacements "$file" "$word" "$rs" "$re" "$REPLACE_TXT" || return 1
         replace_lines "$file" "$word" "$rs" "$re" "$REPLACE_TXT"
     else
-        preview_matches "$file" "$word" || return 1
-
-        # Process matches directly in $AWK_CMD without loading into array for large files
+        # Single awk pass: show preview AND collect matching line numbers.
+        # Avoids the old two-scan approach (preview_matches + find_matches).
         local tmp_matches
         tmp_matches=$(make_temp "$file")
-        find_matches "$file" "$word" > "$tmp_matches"
 
-        if [[ -s "$tmp_matches" ]]; then
-            local -a match_lines
-            mapfile -t match_lines < "$tmp_matches"
-            delete_lines "$file" "${match_lines[@]}"
-        else
-            echo "No matches found" >&2
+        echo "Matches (up to $PREVIEW_LIMIT):"
+        $AWK_CMD \
+            -v w="$word" -v limit="$PREVIEW_LIMIT" \
+            -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
+            -v R="$RED" -v X="$RESET" -v nc="$NO_COLOR" \
+            -v matchfile="$tmp_matches" '
+            BEGIN { shown = 0 }
+            {
+                seg = (s && e) ? substr($0, s, e - s + 1) : $0
+                matched = regex ? match(seg, w) : index(seg, w)
+                if (!matched) next
+
+                print NR >> matchfile
+                shown++
+
+                if (shown <= limit) {
+                    if (nc) {
+                        print NR ":" $0
+                    } else {
+                        if (s && e) {
+                            bef  = substr($0, 1, s - 1)
+                            seg2 = substr($0, s, e - s + 1)
+                            aft  = substr($0, e + 1)
+                            if (regex) gsub(w, R "&" X, seg2)
+                            else {
+                                esc = w
+                                gsub(/[[\\.^$*+?{}()|]/, "\\\\&", esc)
+                                gsub(esc, R w X, seg2)
+                            }
+                            print NR ":" bef seg2 aft
+                        } else {
+                            line = $0
+                            if (regex) gsub(w, R "&" X, line)
+                            else {
+                                esc = w
+                                gsub(/[[\\.^$*+?{}()|]/, "\\\\&", esc)
+                                gsub(esc, R w X, line)
+                            }
+                            print NR ":" line
+                        }
+                    }
+                }
+            }
+            END {
+                if (shown == 0)    { print "No matches found"; exit 1 }
+                if (shown > limit) { print "... +" (shown - limit) " more" }
+            }' "$file"
+
+        local awk_rc=$?
+        if (( awk_rc != 0 )) || [[ ! -s "$tmp_matches" ]]; then
             rm -f "$tmp_matches"
             return 1
         fi
+
+        local -a match_lines
+        mapfile -t match_lines < "$tmp_matches"
         rm -f "$tmp_matches"
+        delete_lines "$file" "${match_lines[@]}"
     fi
 }
 
 # ================= ARGUMENT PARSING =================
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -h|--help) show_help;;
-        -f) FILE="$2"; shift 2;;
-        -l) LINE_NUM="$2"; shift 2;;
-        -w) WORD="$2"; shift 2;;
-        -n) PREVIEW_LIMIT="$2"; shift 2;;
+        -h|--help) show_help ;;
+        -f)  FILE="$2";          shift 2 ;;
+        -l)  LINE_NUM="$2";      shift 2 ;;
+        -w)  WORD="$2";          shift 2 ;;
+        -n)  PREVIEW_LIMIT="$2"; shift 2 ;;
         --pos)
             IFS='-' read -r POS_START POS_END <<< "$2"
-            [[ -n "$POS_START" && -n "$POS_END" ]] || err "--pos format: start-end" "$EXIT_USAGE"
-            [[ "$POS_START" =~ ^[0-9]+$ && "$POS_END" =~ ^[0-9]+$ ]] || err "--pos: start and end must be numbers" "$EXIT_USAGE"
-            (( POS_START >= 1 && POS_END >= POS_START )) || err "--pos: invalid range $POS_START-$POS_END" "$EXIT_USAGE"
-            if (( MAWK_BYTE_MODE )); then
-                info "WARNING: gawk not found. --pos uses byte positions for multi-byte (UTF-8) characters. Install gawk for character-accurate positioning." >&2
-            fi
+            [[ -n "$POS_START" && -n "$POS_END" ]] \
+                || err "--pos format: start-end" "$EXIT_USAGE"
+            [[ "$POS_START" =~ ^[0-9]+$ && "$POS_END" =~ ^[0-9]+$ ]] \
+                || err "--pos: start and end must be numbers" "$EXIT_USAGE"
+            (( POS_START >= 1 && POS_END >= POS_START )) \
+                || err "--pos: invalid range $POS_START-$POS_END" "$EXIT_USAGE"
+            (( MAWK_BYTE_MODE )) \
+                && info "WARNING: gawk not found. --pos uses byte positions for multi-byte (UTF-8) content. Install gawk for character-accurate positioning." >&2
             shift 2
             ;;
-        --replace-pos)
-            REPLACE_POS="$2"
-            REPLACE_MODE=1
-            shift 2
-            ;;
-        --replace-txt)
-            REPLACE_TXT="$2"
-            shift 2
-            ;;
-        --rollback)     ROLLBACK=1; shift;;
-        --regex)        REGEX_MODE=1; shift;;
-        --force)        FORCE_MODE=1; shift;;
-        --yes)          YES_MODE=1; shift;;
-        --dry-run)      DRY_RUN=1; shift;;
-        --no-color)     NO_COLOR=1; shift;;
-        --no-header-footer) NO_HEADER_FOOTER=1; shift;;
-        --merge-next)   MERGE_NEXT=1; shift;;
-        *) err "Unknown option: $1" "$EXIT_USAGE";;
+        --replace-pos)  REPLACE_POS="$2"; REPLACE_MODE=1; shift 2 ;;
+        --replace-txt)  REPLACE_TXT="$2"; shift 2 ;;
+        --rollback)     ROLLBACK=1;        shift ;;
+        --regex)        REGEX_MODE=1;      shift ;;
+        --force)        FORCE_MODE=1;      shift ;;
+        --yes)          YES_MODE=1;        shift ;;
+        --dry-run)      DRY_RUN=1;         shift ;;
+        --no-color)     NO_COLOR=1;        shift ;;
+        --no-header-footer) NO_HEADER_FOOTER=1; shift ;;
+        --no-modified)  NO_MODIFIED=1;     shift ;;
+        --merge-next)   MERGE_NEXT=1;      shift ;;
+        *) err "Unknown option: $1" "$EXIT_USAGE" ;;
     esac
 done
 
@@ -844,10 +833,9 @@ FILE=${FILE:-$DEFAULT_FILE}
 if (( REPLACE_MODE )); then
     [[ -n "$REPLACE_POS" ]] || err "Replace mode requires --replace-pos" "$EXIT_USAGE"
     [[ -n "$REPLACE_TXT" ]] || err "Replace mode requires --replace-txt" "$EXIT_USAGE"
-    [[ -n "$WORD" ]]        || err "Replace mode requires -w <word>" "$EXIT_USAGE"
+    [[ -n "$WORD" ]]        || err "Replace mode requires -w <word>"     "$EXIT_USAGE"
 fi
 
-# --merge-next is only valid with -l; catch misuse before any file operations
 if (( MERGE_NEXT )); then
     [[ -n "$LINE_NUM" ]] || err "--merge-next requires -l <line_num>" "$EXIT_USAGE"
     (( REPLACE_MODE )) && err "--merge-next cannot be combined with --replace-pos/--replace-txt" "$EXIT_USAGE"
@@ -859,13 +847,12 @@ if (( ROLLBACK )); then
     exit "$EXIT_SUCCESS"
 fi
 
-# VALIDATE BEFORE ANY OPERATIONS
 [[ -f "$FILE" ]] || err "File not found: $FILE"
+validate_allowed_path "$FILE"
 validate_file_size "$FILE"
 
-# VALIDATE FOOTER FORMAT FIRST (before any operations, skipped in no-header-footer mode)
-# Capture the total line count so downstream functions can reuse it
-# without paying for another full-file wc -l scan.
+# validate_footer echoes the total line count — cache it so all downstream
+# functions can reuse it without paying for another full-file wc -l scan.
 if [[ -n "$LINE_NUM" || -n "$WORD" ]]; then
     CACHED_TOTAL=$(validate_footer "$FILE")
 fi

@@ -61,7 +61,7 @@ setup() {
         echo "# Line Delete Script - Test Suite Timing Log"
         echo "# Generated: $(date '+%Y-%m-%d %H:%M:%S')"
         echo "# Format: <group> | <elapsed_ms> ms | <wall_clock>"
-        echo "# ─────────────────────────────────────────────────────"
+        echo "# _____________________________________________________"
     } > "$TIMING_LOG"
 
     echo "  Setup complete!"
@@ -91,10 +91,10 @@ fail() {
 }
 
 section() {
-    echo -e "\n${BLUE}═══════════════════════════════════════${RESET}"
+    echo -e "\n${BLUE}=======================================${RESET}"
     echo -e "${BLUE}Test Group: $1${RESET}"
     echo -e "${BLUE}  Folder: $CURRENT_TEST_DIR${RESET}"
-    echo -e "${BLUE}═══════════════════════════════════════${RESET}"
+    echo -e "${BLUE}=======================================${RESET}"
 }
 
 assert() {
@@ -130,7 +130,7 @@ assert_no_output() {
     fi
 }
 
-# ── TIMING HELPERS ──────────────────────────────────────────────────────────
+# __ TIMING HELPERS __________________________________________________________
 # Returns current time in milliseconds (integer)
 now_ms() { python3 -c "import time; print(int(time.time()*1000))"; }
 
@@ -161,7 +161,7 @@ timed_run_cmd() {
     log_timing "$label" "$t0" "$t1"
     echo "$output"
 }
-# ─────────────────────────────────────────────────────────────────────────────
+# _____________________________________________________________________________
 
 # Runs the script, writes stdout+stderr to output.log, and also returns them
 # to the caller so  out=$(run_cmd ...)  still works as before.
@@ -975,7 +975,7 @@ sys.stdout.buffer.write('\n'.join(lines).encode('utf-8') + b'\n')
 #   mrg   Merge two lines                (-l --merge-next)
 #   rb    Rollback                       (--rollback)
 
-# ── Generator ────────────────────────────────────────────────────────────────
+# __ Generator ________________________________________________________________
 generate_large_file() {
     local target_gb="${1:-10}"
     local LARGE_GEN_PY="${2:-}"
@@ -1013,7 +1013,7 @@ generate_large_file() {
     echo "  Actual lines: ${actual_lines}"
 }
 
-# ── Test ─────────────────────────────────────────────────────────────────────
+# __ Test _____________________________________________________________________
 test_large_file() {
     if [[ "${RUN_LARGE_FILE_TEST:-0}" != "1" ]]; then
         echo -e "\n${YELLOW}⚠ SKIPPED: test_large_file — set RUN_LARGE_FILE_TEST=1 to run${RESET}"
@@ -1025,7 +1025,7 @@ test_large_file() {
 
     FILE="$CURRENT_TEST_DIR/large_data.txt"
 
-    # ── Disk space guard: need ~35GB (file + backup + temp + base copy) ───────
+    # __ Disk space guard: need ~35GB (file + backup + temp + base copy) _______
     local free_gb
     free_gb=$(df "$CURRENT_TEST_DIR" | tail -1 | awk '{printf "%d", $4 / (1024*1024)}')
     if (( free_gb < 35 )); then
@@ -1035,7 +1035,7 @@ test_large_file() {
     echo "  Disk free: ~${free_gb}GB — proceeding"
     echo ""
 
-    # ── Locate the generator (prefer .sh, fall back to .py) ─────────────────
+    # __ Locate the generator (prefer .sh, fall back to .py) _________________
     # Look next to the test script first, then in the working directory.
     local SCRIPT_DIR
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -1060,14 +1060,14 @@ test_large_file() {
     fi
     echo "  Generator   : $LARGE_GEN"
 
-    # ── Generate ──────────────────────────────────────────────────────────────
+    # __ Generate ______________________________________________________________
     generate_large_file 10 "$LARGE_GEN"
 
     local total_lines mid_line t0 t1 out lines_after
     total_lines=$(wc -l < "$FILE")
     mid_line=$(( total_lines / 2 ))
 
-    # ── Save base copy (used to reset between tests) ───────────────────────────
+    # __ Save base copy (used to reset between tests) ___________________________
     local BASE="$CURRENT_TEST_DIR/large_data_base.txt"
     t0=$(now_ms)
     cp "$FILE" "$BASE"
@@ -1087,10 +1087,10 @@ test_large_file() {
     echo "  Each timed op runs on a fresh copy of the file."
     echo ""
 
-    # ── Op 1: Delete by line number ───────────────────────────────────────────
+    # __ Op 1: Delete by line number ___________________________________________
     fresh_copy "delete by line"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -l "$mid_line" --yes --no-color >/dev/null 2>&1 || true
+    bash "$SCRIPT" -f "$FILE" -l "$mid_line" --yes --no-color --no-modified >/dev/null 2>&1 || true
     t1=$(now_ms)
     log_timing "31 large: -l <mid_line> delete" "$t0" "$t1"
     lines_after=$(wc -l < "$FILE")
@@ -1105,12 +1105,12 @@ test_large_file() {
         fail "delete by line: footer invalid"
     fi
 
-    # ── Op 2: Delete by keyword (CAT=Z, ~total_lines/1000 hits) ──────────────
+    # __ Op 2: Delete by keyword (CAT=Z, ~total_lines/1000 hits) ______________
     fresh_copy "delete by keyword"
     local expected_z=$(( (total_lines - 2) / 1000 ))
     echo "  Expected CAT=Z hits: ~${expected_z}"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -w "CAT=Z" --yes --no-color >/dev/null 2>&1 || true
+    bash "$SCRIPT" -f "$FILE" -w "CAT=Z" --yes --no-color --no-modified >/dev/null 2>&1 || true
     t1=$(now_ms)
     log_timing "31 large: -w CAT=Z delete (~${expected_z} hits)" "$t0" "$t1"
     if ! grep -qF "CAT=Z" "$FILE"; then
@@ -1124,12 +1124,12 @@ test_large_file() {
         fail "delete by keyword: footer invalid"
     fi
 
-    # ── Op 3: Delete by regex (CORRUPT=1, ~total_lines/2000 hits) ────────────
+    # __ Op 3: Delete by regex (CORRUPT=1, ~total_lines/2000 hits) ____________
     fresh_copy "delete by regex"
     local expected_c=$(( (total_lines - 2) / 2000 ))
     echo "  Expected CORRUPT hits: ~${expected_c}"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -w "CORRUPT=1" --regex --yes --no-color >/dev/null 2>&1 || true
+    bash "$SCRIPT" -f "$FILE" -w "CORRUPT=1" --regex --yes --no-color --no-modified >/dev/null 2>&1 || true
     t1=$(now_ms)
     log_timing "31 large: -w --regex CORRUPT=1 delete (~${expected_c} hits)" "$t0" "$t1"
     if ! grep -qF "CORRUPT=1" "$FILE"; then
@@ -1143,7 +1143,7 @@ test_large_file() {
         fail "delete by regex: footer invalid"
     fi
 
-    # ── Op 4: Keyword + position filter, dry-run (full file scan) ────────────
+    # __ Op 4: Keyword + position filter, dry-run (full file scan) ____________
     # "ITEM" at bytes 7-10 of every data line
     fresh_copy "keyword+pos dry-run"
     t0=$(now_ms)
@@ -1156,10 +1156,10 @@ test_large_file() {
         fail "keyword+pos dry-run: no matches reported"
     fi
 
-    # ── Op 5: Replace by keyword (CAT=Z lines, replace first 5 chars) ─────────
+    # __ Op 5: Replace by keyword (CAT=Z lines, replace first 5 chars) _________
     fresh_copy "replace by keyword"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -w "CAT=Z" --replace-pos 1-5 --replace-txt "FIXED" --yes --no-color >/dev/null 2>&1 || true
+    bash "$SCRIPT" -f "$FILE" -w "CAT=Z" --replace-pos 1-5 --replace-txt "FIXED" --yes --no-color --no-modified >/dev/null 2>&1 || true
     t1=$(now_ms)
     log_timing "31 large: -w CAT=Z --replace-pos 1-5 (~${expected_z} hits)" "$t0" "$t1"
     if grep -qF "FIXED" "$FILE"; then
@@ -1173,12 +1173,12 @@ test_large_file() {
         fail "replace by keyword: footer invalid"
     fi
 
-    # ── Op 6: Merge two lines ─────────────────────────────────────────────────
+    # __ Op 6: Merge two lines _________________________________________________
     fresh_copy "merge-next"
     local footer_pre_merge
     footer_pre_merge=$(get_footer "$FILE")
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -l "$mid_line" --merge-next --yes --no-color >/dev/null 2>&1 || true
+    bash "$SCRIPT" -f "$FILE" -l "$mid_line" --merge-next --yes --no-color --no-modified >/dev/null 2>&1 || true
     t1=$(now_ms)
     log_timing "31 large: -l --merge-next (mid line)" "$t0" "$t1"
     lines_after=$(wc -l < "$FILE")
@@ -1193,7 +1193,7 @@ test_large_file() {
         fail "merge-next: footer changed unexpectedly"
     fi
 
-    # ── Op 7: Rollback ────────────────────────────────────────────────────────
+    # __ Op 7: Rollback ________________________________________________________
     # Backup was created by the merge above
     t0=$(now_ms)
     out=$(bash "$SCRIPT" -f "$FILE" --rollback --yes --no-color 2>&1 || true)
@@ -1218,9 +1218,9 @@ test_large_file() {
 
 # ================= RUN ALL TESTS =================
 main() {
-    echo -e "${YELLOW}════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
     echo -e "${YELLOW}   Line Delete Script - Test Suite${RESET}"
-    echo -e "${YELLOW}════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
     echo
 
     setup
@@ -1295,13 +1295,13 @@ main() {
 
     # Summary
     echo
-    echo -e "${YELLOW}════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
     echo -e "${YELLOW}           Test Summary${RESET}"
-    echo -e "${YELLOW}════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
     echo -e "${GREEN}PASSED: $PASS${RESET}"
     echo -e "${RED}FAILED: $FAIL${RESET}"
     echo -e "TOTAL:  $((PASS + FAIL))"
-    echo -e "${YELLOW}════════════════════════════════════════${RESET}"
+    echo -e "${YELLOW}========================================${RESET}"
     echo
     echo -e "Test artifacts saved in: ${BLUE}$BASE_TESTDIR/${RESET}"
     echo
@@ -1312,7 +1312,7 @@ main() {
     suite_start_ms=$(( SUITE_START_NS / 1000000 ))
     total_ms=$(( suite_end_ms - suite_start_ms ))
     {
-        echo "# ─────────────────────────────────────────────────────"
+        echo "# _____________________________________________________"
         printf "%-55s | %6d ms | %s\n" "TOTAL SUITE" "$total_ms" "$(date '+%H:%M:%S')"
     } >> "$TIMING_LOG"
 
@@ -1320,10 +1320,10 @@ main() {
     echo
 
     if (( FAIL > 0 )); then
-        echo -e "${RED}❌ Some tests failed${RESET}"
+        echo -e "${RED} Some tests failed${RESET}"
         exit 1
     else
-        echo -e "${GREEN}✅ All tests passed${RESET}"
+        echo -e "${GREEN} All tests passed${RESET}"
         exit 0
     fi
 }
