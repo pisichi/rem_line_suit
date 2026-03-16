@@ -24,6 +24,12 @@ MERGE_NEXT=0
 NO_MODIFIED=0
 DEFAULT_FILE="./data.txt"
 
+# Maximum number of lines allowed to be changed in a single operation.
+# This script is a surgical tool for fixing corrupt reconcile reports —
+# large match counts almost always indicate a bad search pattern.
+# Set to 0 to disable the guard.
+MAX_CHANGES=100
+
 POS_START=""
 POS_END=""
 REPLACE_MODE=0
@@ -51,10 +57,9 @@ CACHED_FOOTER_NUM=""
 # cannot bypass the allowlist.
 # Leave the array empty to disable the check entirely (allow any path).
 ALLOWED_PATHS=(
-    # "/data/files"
-    # "/mnt/batch"
-    # "/home/user/workspace"
-)""
+    "/mnt/e/workspace/rem_line_suit"
+
+)
 
 # ================= AWK / LOCALE SETUP =================
 # gawk + C.UTF-8 gives true character-aware substr/length/index for --pos.
@@ -94,6 +99,15 @@ validate_regex() {
     local pattern="$1"
     timeout 2s awk "BEGIN { if (match(\"test\", \"$pattern\")) print \"ok\" }" 2>/dev/null \
         || err "Regex pattern is invalid or too slow (potential ReDoS): $pattern"
+}
+
+# ================= CHANGE LIMIT GUARD =================
+check_max_changes() {
+    local count="$1" context="$2"
+    (( MAX_CHANGES == 0 )) && return 0
+    if (( count > MAX_CHANGES )); then
+        err "$context: $count lines matched, but MAX_CHANGES=$MAX_CHANGES.\n  This looks like an unintended bulk operation. Aborting.\n  Use a more specific search pattern, or raise MAX_CHANGES if intentional."
+    fi
 }
 
 # ================= LARGE FILE HANDLING =================
@@ -179,6 +193,9 @@ CONTROL OPTIONS:
   --yes                    Skip all confirmation prompts
   --dry-run                Show what would happen without making changes
   --no-color               Disable colored output
+  --max-changes N          Abort if more than N lines would be changed
+                           (default: 100, 0 = unlimited). Guards against
+                           accidentally broad search patterns.
   --no-modified            Skip saving deleted/replaced lines to a
                            _modified_* file. Eliminates an extra full-file
                            scan — recommended for large files where you
@@ -499,6 +516,7 @@ delete_lines() {
     fi
 
     info "Will delete ${#filtered[@]} line(s)"
+    check_max_changes "${#filtered[@]}" "Delete"
 
     if (( DRY_RUN )); then
         (( ! NO_HEADER_FOOTER )) \
@@ -593,6 +611,7 @@ replace_lines() {
     (( match_count > 0 )) || { echo "Error: No matches found" >&2; return 1; }
 
     info "Found $match_count line(s) to replace"
+    check_max_changes "$match_count" "Replace"
     confirm "Replace text in $match_count lines?" || return
 
     local backup tmp
@@ -822,6 +841,7 @@ while [[ $# -gt 0 ]]; do
         --no-color)     NO_COLOR=1;        shift ;;
         --no-header-footer) NO_HEADER_FOOTER=1; shift ;;
         --no-modified)  NO_MODIFIED=1;     shift ;;
+        --max-changes)  MAX_CHANGES="$2";  shift 2 ;;
         --merge-next)   MERGE_NEXT=1;      shift ;;
         *) err "Unknown option: $1" "$EXIT_USAGE" ;;
     esac
