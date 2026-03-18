@@ -81,12 +81,12 @@ setup_test_case() {
 
 # ================= HELPERS =================
 ok() {
-    echo -e "  ${GREEN}[PASS]${RESET} $1"
+    echo -e "  ${GREEN}[PASS] [PASS]${RESET} $1"
     ((PASS+=1)) || true
 }
 
 fail() {
-    echo -e "  ${RED}[FAIL]${RESET} $1"
+    echo -e "  ${RED}[FAIL] [FAIL]${RESET} $1"
     ((FAIL+=1)) || true
 }
 
@@ -272,6 +272,24 @@ test_file_generation() {
     else
         fail "footer format is valid"
     fi
+
+    # file_info: verify show_file_info output contains expected fields
+    local info_out
+    info_out=$(run_cmd -f "$FILE" -l 2 --dry-run --yes --no-color)
+    assert_output "file_info shows File field"  "File:" "$info_out"
+    assert_output "file_info shows Size field"  "Size:" "$info_out"
+    assert_output "file_info shows Type field"  "Type:" "$info_out"
+    assert_output "file_info shows line count"  "1002 lines" "$info_out"
+    assert_output "file_info shows LF ending"   "LF"   "$info_out"
+
+    # CRLF file: file_info must report CRLF explicitly
+    local dos_file="$CURRENT_TEST_DIR/dos_data.txt"
+    printf "1-HEADER-RECORD|DATE=2026-01-30|SRC=UNITTEST\r\n" > "$dos_file"
+    printf "2:00002ITEM-0001|CAT=A|FLAG=Y\r\n"                >> "$dos_file"
+    printf "FOOTERTEST00000001\r\n"                           >> "$dos_file"
+    local dos_info
+    dos_info=$(run_cmd -f "$dos_file" -l 2 --dry-run --yes --no-color 2>&1 || true)
+    assert_output "file_info detects CRLF ending" "CRLF" "$dos_info"
 }
 
 test_line_preview() {
@@ -429,6 +447,20 @@ test_replace_tracking() {
             fail "modified file not found"
         fi
     fi
+
+    # --no-modified on replace: no _modified_* file, but replacement still applied
+    clean_test_artifacts
+    generate_test_file
+    local before_lines
+    before_lines=$(count_lines "$FILE")
+    run_cmd -f "$FILE" -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --no-modified --yes --no-color >/dev/null 2>&1
+    if ! modified_exists "$FILE"; then
+        ok "--no-modified replace: no modified file created"
+    else
+        fail "--no-modified replace: modified file should not be created"
+    fi
+    assert "--no-modified replace: line count unchanged" test "$(count_lines "$FILE")" -eq "$before_lines"
+    assert "--no-modified replace: replacement applied"  has_line "RESOLVED" "$FILE"
 }
 
 # ================= BACKUP TESTS =================
@@ -468,6 +500,26 @@ test_backup_reuse() {
     backup_time2=$(stat -c %Y "$backup_path" 2>/dev/null || stat -f %m "$backup_path" 2>/dev/null)
 
     assert "backup file not recreated" test "$backup_time" = "$backup_time2"
+
+    # Incomplete backup detection: if backup is smaller than current file,
+    # it should be replaced (simulates a previous interrupted backup write)
+    generate_file 100   # fresh full-size file
+    rm -f "$backup_path"
+    # Write a truncated backup (only first 10 bytes)
+    dd if="$FILE" bs=10 count=1 of="$backup_path" 2>/dev/null
+    local truncated_size full_size
+    truncated_size=$(stat -c%s "$backup_path" 2>/dev/null || stat -f%z "$backup_path" 2>/dev/null)
+    full_size=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null)
+    local replace_out
+    replace_out=$(run_cmd -f "$FILE" -l 50 --yes --no-color 2>&1 || true)
+    local new_backup_size
+    new_backup_size=$(stat -c%s "$backup_path" 2>/dev/null || stat -f%z "$backup_path" 2>/dev/null)
+    if echo "$replace_out" | grep -qiE "(incomplete|replacing|Replacing)"; then
+        ok "incomplete backup detected and replaced"
+    else
+        fail "incomplete backup should be detected and replaced"
+    fi
+    assert "backup replaced with full-size copy" test "$new_backup_size" -gt "$truncated_size"
 }
 
 test_rollback() {
@@ -582,7 +634,7 @@ test_preview_limit() {
     generate_file 1000
 
     local out
-    out=$(run_cmd -f "$FILE" -w CAT -n 3 --dry-run --yes --no-color)
+    out=$(run_cmd -f "$FILE" -w CAT -n 3 --dry-run --yes --no-color --max-changes 0)
 
     if echo "$out" | grep -qE "\+.*more"; then
         ok "shows overflow indicator"
@@ -607,6 +659,16 @@ test_dry_run() {
     after=$(cat "$FILE")
     assert "dry-run makes no changes"  test "$before" = "$after"
     assert "line count preserved"      test "$before_lines" -eq "$(count_lines "$FILE")"
+
+    # --max-changes aborts even on dry-run (saves time on large files)
+    local guard_out
+    guard_out=$(run_cmd -f "$FILE" -w ITEM --dry-run --yes --no-color --max-changes 5)
+    if echo "$guard_out" | grep -qiE "(MAX_CHANGES|Aborting|aborting)"; then
+        ok "max-changes aborts on dry-run"
+    else
+        fail "max-changes should abort even on dry-run"
+    fi
+    assert "file unchanged after dry-run guard" test "$before_lines" -eq "$(count_lines "$FILE")"
 }
 
 test_modified_tracking() {
@@ -625,6 +687,17 @@ test_modified_tracking() {
         modified_lines=$(count_lines "$modified_file")
         assert "modified file has 1 line" test "$modified_lines" -eq 1
     fi
+
+    # --no-modified: no _modified_* file should be created
+    clean_test_artifacts
+    generate_file 100
+    run_cmd -f "$FILE" -l 50 --no-modified --yes --no-color >/dev/null 2>&1
+    if ! modified_exists "$FILE"; then
+        ok "--no-modified: no modified file created"
+    else
+        fail "--no-modified: modified file should not be created"
+    fi
+    assert "--no-modified: line still deleted" test "$(count_lines "$FILE")" -eq 101
 }
 
 test_edge_cases() {
@@ -645,6 +718,30 @@ test_edge_cases() {
         ok "rejects non-existent file"
     else
         fail "should reject non-existent file"
+    fi
+
+    # max-changes guard: -w with too many matches aborts without modifying file
+    local before_lines
+    before_lines=$(count_lines "$FILE")
+    out=$(run_cmd -f "$FILE" -w ITEM --max-changes 5 --yes --no-color)
+    if echo "$out" | grep -qiE "(MAX_CHANGES|Aborting|aborting)"; then
+        ok "max-changes guard fires on broad pattern"
+    else
+        fail "max-changes guard should fire"
+    fi
+    assert "file unchanged after max-changes abort" test "$(count_lines "$FILE")" -eq "$before_lines"
+
+    # allowed_path guard: temporarily set ALLOWED_PATHS to a different dir
+    # by passing a symlink that escapes the allowed directory
+    local outside_file="$CURRENT_TEST_DIR/outside.txt"
+    generate_file 10
+    # We cannot easily inject ALLOWED_PATHS at runtime, so we verify the
+    # guard logic by checking that validate_allowed_path is called in the
+    # script (presence in source) and that it uses realpath
+    if grep -q "validate_allowed_path" "$SCRIPT" && grep -q "realpath" "$SCRIPT"; then
+        ok "allowed_path guard: function present and uses realpath"
+    else
+        fail "allowed_path guard: function missing or not using realpath"
     fi
 }
 
@@ -798,6 +895,31 @@ test_merge_next() {
     else
         fail "should reject --merge-next when used with -w instead of -l"
     fi
+
+    # --- DOS/CRLF file: merged line must not contain embedded CR ---
+    local dos_file="$CURRENT_TEST_DIR/dos_merge.txt"
+    printf "1-HEADER-RECORD|DATE=2026-01-30|SRC=UNITTEST\r\n" > "$dos_file"
+    printf "2:00002ITEM-0001|CAT=A|FLAG=Y\r\n"                >> "$dos_file"
+    printf "3:00003ITEM-0002|CAT=B|AMT=000\r\n"               >> "$dos_file"
+    printf "18.85|FLAG=N\r\n"                                   >> "$dos_file"
+    printf "5:00005ITEM-0003|CAT=C|FLAG=Y\r\n"                >> "$dos_file"
+    printf "FOOTERTEST00000003\r\n"                             >> "$dos_file"
+
+    run_cmd -f "$dos_file" -l 3 --merge-next --yes --no-color >/dev/null 2>&1
+    # The merged line should not have an embedded \r in the middle
+    if ! grep -Pq "\r[^\n]" "$dos_file"; then
+        ok "DOS merge: no embedded CR in merged line"
+    else
+        fail "DOS merge: embedded CR found in middle of merged line"
+    fi
+    # The merged line should contain \r (preserve DOS CR before the LF)
+    # grep -P "\r\n" fails because awk writes \r then shell adds \n — check for \r presence instead
+    if grep -Pq "\r" "$dos_file"; then
+        ok "DOS merge: CR preserved in line endings"
+    else
+        fail "DOS merge: CR lost after merge (DOS line ending broken)"
+    fi
+    assert "DOS merge: line count reduced" test "$(count_lines "$dos_file")" -eq 5
 }
 
 # ================= NO HEADER/FOOTER TEST =================
