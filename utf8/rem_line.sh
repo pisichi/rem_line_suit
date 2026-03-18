@@ -166,7 +166,7 @@ validate_allowed_path() {
 # ================= FILE INFO =================
 show_file_info() {
     local file="$1"
-    local size size_str total line_ending format_str record_str
+    local size size_str total file_type
     size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
     if   (( size >= 1073741824 )); then size_str="$(awk "BEGIN{printf \"%.1f GB\",$size/1073741824}")"
     elif (( size >= 1048576    )); then size_str="$(awk "BEGIN{printf \"%.1f MB\",$size/1048576}")"
@@ -174,25 +174,21 @@ show_file_info() {
     else                                size_str="${size} B"
     fi
     total="${CACHED_TOTAL:-$(wc -l < "$file")}"
-    head -c 4096 "$file" | grep -qP "\r" 2>/dev/null && line_ending="DOS (CRLF)" || line_ending="Unix (LF)"
-    if (( NO_HEADER_FOOTER )); then
-        format_str="Plain (no header/footer)"; record_str="$total lines total"
-    else
-        local footer_val="${CACHED_FOOTER_NUM:+${FOOTER_PREFIX}${CACHED_FOOTER_NUM}}"
-        [[ -z "$footer_val" ]] && footer_val=$(tail -n 1 "$file" | tr -d '[:space:]')
-        format_str="Structured (header + footer)"
-        record_str="$(( total - 2 )) records  |  footer: $footer_val"
-    fi
+    # Encoding from `file` (strips filename prefix).
+    # `file` only mentions CRLF when detected — for LF files it says nothing,
+    # so we always append line ending explicitly.
+    local encoding line_ending eol_label
+    encoding=$(file "$file" 2>/dev/null | sed 's/^[^:]*: //; s/, with CRLF line terminators//')
+    head -c 4096 "$file" | grep -qP "\r" 2>/dev/null         && line_ending="CRLF" || line_ending="LF"
+    local file_type="${encoding}, ${line_ending}"
     if (( NO_COLOR )); then
-        printf -- "---\n  File:        %s\n  Size:        %s  (%s lines)\n  Line ending: %s\n  Format:      %s\n  Records:     %s\n---\n" \
-            "$file" "$size_str" "$total" "$line_ending" "$format_str" "$record_str"
+        printf -- "---\n  File: %s\n  Size: %s  (%s lines)\n  Type: %s\n---\n" \
+            "$file" "$size_str" "$total" "$file_type"
     else
         echo -e "${YELLOW}---${RESET}"
-        printf "  ${YELLOW}%-12s${RESET} %s\n" "File:"        "$file"
-        printf "  ${YELLOW}%-12s${RESET} %s  (%s lines)\n"  "Size:"        "$size_str" "$total"
-        printf "  ${YELLOW}%-12s${RESET} %s\n" "Line ending:" "$line_ending"
-        printf "  ${YELLOW}%-12s${RESET} %s\n" "Format:"      "$format_str"
-        printf "  ${YELLOW}%-12s${RESET} %s\n" "Records:"     "$record_str"
+        printf "  ${YELLOW}%-6s${RESET} %s\n"              "File:" "$file"
+        printf "  ${YELLOW}%-6s${RESET} %s  (%s lines)\n" "Size:" "$size_str" "$total"
+        printf "  ${YELLOW}%-6s${RESET} %s\n"              "Type:" "$file_type"
         echo -e "${YELLOW}---${RESET}"
     fi
 }
@@ -498,16 +494,28 @@ replace_lines() {
     (( NO_HEADER_FOOTER )) && { awk_header=0; awk_footer=0; } \
                            || { awk_header="$HEADER_LINE_NUM"; awk_footer="$total"; }
 
-    if (( DRY_RUN )); then
-        local dry_count; dry_count=$(find_matches "$word" "$file" | wc -l)
-        (( dry_count > 0 )) || { echo "No matches found" >&2; return 1; }
-        info "[DRY-RUN] Would replace text in $dry_count line(s)"; return 0
-    fi
+    # Count matches with early exit — stops scanning as soon as MAX_CHANGES+1
+    # is hit so we never read the full file just to trigger the guard.
+    local match_count
+    match_count=$($AWK_CMD -v w="$word" -v s="$POS_START" -v e="$POS_END"         -v regex="$REGEX_MODE" -v maxchg="$MAX_CHANGES" '
+        BEGIN { n=0 }
+        {
+            seg = (s&&e) ? substr($0,s,e-s+1) : $0
+            if (regex ? match(seg,w) : index(seg,w)) {
+                n++
+                if (maxchg > 0 && n > maxchg) { print n; exit }
+            }
+        }
+        END { print n }
+    ' "$file")
 
-    local match_count; match_count=$(find_matches "$word" "$file" | wc -l)
     (( match_count > 0 )) || { echo "Error: No matches found" >&2; return 1; }
-    info "Found $match_count line(s) to replace"
     check_max_changes "$match_count" "Replace"
+
+    if (( DRY_RUN )); then
+        info "[DRY-RUN] Would replace text in $match_count line(s)"; return 0
+    fi
+    info "Found $match_count line(s) to replace"
     confirm "Replace text in $match_count lines?" || return
 
     local backup tmp modified_out cnt_file
@@ -618,13 +626,19 @@ keyword_search() {
         -v w="$word" -v limit="$PREVIEW_LIMIT" \
         -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
         -v R="$RED" -v X="$RESET" -v nc="$NO_COLOR" \
-        -v matchfile="$tmp_matches" '
+        -v matchfile="$tmp_matches" -v maxchg="$MAX_CHANGES" '
         BEGIN { shown=0 }
         {
             seg = (s&&e) ? substr($0,s,e-s+1) : $0
             if (!(regex ? match(seg,w) : index(seg,w))) next
             print NR >> matchfile
             shown++
+            # Early exit: stop scanning as soon as MAX_CHANGES is exceeded.
+            # Aborts even in --dry-run to save time on large files.
+            if (maxchg > 0 && shown > maxchg) {
+                print "Error: "shown" lines matched so far, but MAX_CHANGES="maxchg". Aborting." > "/dev/stderr"
+                exit 2
+            }
             if (shown <= limit) {
                 if (nc) { print NR":"$0 }
                 else {
@@ -644,10 +658,14 @@ keyword_search() {
         }
         END {
             if (shown==0)    { print "No matches found"; exit 1 }
-            if (shown>limit) { print "... +"(shown-limit)" more" }
+            if (shown > limit) { print "... +"(shown-limit)" more" }
         }' "$file"
 
     local awk_rc=$?
+    if (( awk_rc == 2 )); then
+        rm -f "$tmp_matches"
+        err "Too many matches. Use a more specific pattern, or raise --max-changes."
+    fi
     if (( awk_rc != 0 )) || [[ ! -s "$tmp_matches" ]]; then rm -f "$tmp_matches"; return 1; fi
     local -a match_lines; mapfile -t match_lines < "$tmp_matches"; rm -f "$tmp_matches"
     delete_lines "$file" "${match_lines[@]}"
