@@ -1410,11 +1410,11 @@ test_large_file() {
     echo ""
     echo "  [Stress] -w --regex --pos delete: 1 / 100 / 1000 hits"
     # CHECKSUM field starts after |PAD=...<460 chars>| — it's near end of line.
-    # Use --pos scoped to last 20 chars of the ~520-char line: pos 501-520.
+    # CHECKSUM value pos varies 518-535 by line number; use 515-540 to cover all cases.
 
     fresh_copy "stress -w --regex --pos x1"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0001" --regex --pos 501-520         --yes --no-color --no-modified --max-changes 5 2>/dev/null || true
+    large_run -f "$FILE" -w "CHECKSUM=0001" --regex --pos 515-540         --yes --no-color --no-modified --max-changes 5 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 stress: -w --regex --pos delete x1" "$t0" "$t1"
     if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x1: footer valid"
@@ -1422,7 +1422,7 @@ test_large_file() {
 
     fresh_copy "stress -w --regex --pos x100"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --regex --pos 501-520         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --regex --pos 515-540         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 stress: -w --regex --pos delete x100" "$t0" "$t1"
     if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x100: footer valid"
@@ -1430,7 +1430,7 @@ test_large_file() {
 
     fresh_copy "stress -w --regex --pos x1000"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --regex --pos 501-520         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --regex --pos 515-540         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 stress: -w --regex --pos delete x1000" "$t0" "$t1"
     if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x1000: footer valid"
