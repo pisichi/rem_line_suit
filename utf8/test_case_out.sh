@@ -1205,6 +1205,18 @@ test_large_file() {
         log_timing "31 large: reset [$label]" "$tc0" "$tc1"
     }
 
+    # Runs the script, logs command + full output to output.log, returns output.
+    large_run() {
+        local output
+        output=$(bash "$SCRIPT" "$@" 2>&1 || true)
+        {
+            echo "$ bash $SCRIPT $*"
+            echo "$output"
+            echo "---"
+        } >> "$CURRENT_TEST_DIR/output.log"
+        echo "$output"
+    }
+
     # All ops use --max-changes 50 to reflect real usage: this script is a
     # surgical tool for fixing corrupt reconcile reports, not a bulk processor.
     # Target lines are chosen to be rare (1-5 hits) or at known positions.
@@ -1219,7 +1231,7 @@ test_large_file() {
     # -- Op 1: Delete by line number (1 hit, most common use case) ------------
     fresh_copy "delete by line"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -l "$mid_line" --yes --no-color --no-modified >/dev/null 2>&1 || true
+    large_run -f "$FILE" -l "$mid_line" --yes --no-color --no-modified 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 large: -l <mid_line> delete (1 line)" "$t0" "$t1"
     lines_after=$(wc -l < "$FILE")
@@ -1239,7 +1251,7 @@ test_large_file() {
     # First hit is at seq=9974 (i=9975 in generator, 0-indexed from header).
     fresh_copy "delete by unique keyword"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -w "CHECKSUM=0001" --yes --no-color --no-modified         --max-changes 5 >/dev/null 2>&1 || true
+    large_run -f "$FILE" -w "CHECKSUM=0001" --yes --no-color --no-modified         --max-changes 5 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 large: -w CHECKSUM=0001 delete (1 hit)" "$t0" "$t1"
     if ! grep -qF "CHECKSUM=0001" "$FILE" 2>/dev/null; then
@@ -1258,7 +1270,7 @@ test_large_file() {
     # -- Op 3: Delete by regex -- specific CHECKSUM range (2-3 hits) -----------
     fresh_copy "delete by regex"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -w "CHECKSUM=000[23]$" --regex --yes --no-color --no-modified         --max-changes 50 >/dev/null 2>&1 || true
+    large_run -f "$FILE" -w "CHECKSUM=000[23]$" --regex --yes --no-color --no-modified         --max-changes 50 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 large: -w --regex CHECKSUM=000[23] delete (~few hits)" "$t0" "$t1"
     if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then
@@ -1275,7 +1287,7 @@ test_large_file() {
     t0=$(now_ms)
     # CAT= starts at char 14 in lines like: "2:00002ITEM-0001|CAT=..."
     # pos 14-18 covers "CAT=Z" exactly -- scans only 5 chars per line
-    out=$(bash "$SCRIPT" -f "$FILE" -w "CAT=Z" --pos 14-18 -n 3 --dry-run         --yes --no-color --max-changes 50 2>&1 || true)
+    out=$(large_run -f "$FILE" -w "CAT=Z" --pos 14-18 -n 3 --dry-run         --yes --no-color --max-changes 50 2>&1 || true)
     t1=$(now_ms)
     log_timing "31 large: -w CAT=Z --pos 14-18 dry-run (scoped scan)" "$t0" "$t1"
     if echo "$out" | grep -qiE "(match|more|CAT=Z)"; then
@@ -1287,7 +1299,7 @@ test_large_file() {
     # -- Op 5: Replace -- single unique line ------------------------------------
     fresh_copy "replace single line"
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -w "CHECKSUM=0042" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 50 >/dev/null 2>&1 || true
+    large_run -f "$FILE" -w "CHECKSUM=0042" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 50 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 large: -w CHECKSUM=0042 --replace-pos (few hits)" "$t0" "$t1"
     if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then
@@ -1301,7 +1313,7 @@ test_large_file() {
     local footer_pre_merge
     footer_pre_merge=$(get_footer "$FILE")
     t0=$(now_ms)
-    bash "$SCRIPT" -f "$FILE" -l "$mid_line" --merge-next --yes --no-color >/dev/null 2>&1 || true
+    large_run -f "$FILE" -l "$mid_line" --merge-next --yes --no-color 2>/dev/null || true
     t1=$(now_ms)
     log_timing "31 large: -l --merge-next (mid line)" "$t0" "$t1"
     lines_after=$(wc -l < "$FILE")
@@ -1317,36 +1329,49 @@ test_large_file() {
     fi
 
     # -- Op 7: Max-changes guard fires on a broad pattern ----------------------
-    fresh_copy "max-changes guard"
-    out=$(bash "$SCRIPT" -f "$FILE" -w "FLAG=Y" --yes --no-color --max-changes 10 2>&1 || true)
+    # Note: no fresh_copy here — we test on the current file (post-merge).
+    # fresh_copy would delete the backup that Op 6 created, breaking rollback.
+    out=$(large_run -f "$FILE" -w "FLAG=Y" --yes --no-color --max-changes 10 2>&1 || true)
     if echo "$out" | grep -qiE "(MAX_CHANGES|Aborting|too many|unintended)"; then
         ok "max-changes guard: aborts broad pattern correctly"
     else
         fail "max-changes guard: should have aborted"
     fi
-    # File must be untouched
-    if (( $(wc -l < "$FILE") == total_lines )); then
-        ok "max-changes guard: file unchanged after abort"
+    # File must be untouched (aborted before any write)
+    lines_after=$(wc -l < "$FILE")
+    if (( lines_after == total_lines - 1 )); then
+        ok "max-changes guard: file unchanged after abort (still post-merge)"
     else
-        fail "max-changes guard: file was modified despite abort"
+        fail "max-changes guard: unexpected line count $lines_after after abort"
     fi
 
     # -- Op 8: Rollback --------------------------------------------------------
-    # Backup was created by the merge above
+    # Backup was created by Op 6 (merge-next) and preserved — fresh_copy was
+    # intentionally skipped in Op 7 so the backup still exists here.
+    # The backup was taken from the BASE (pre-merge), so rollback should restore
+    # the file to total_lines (full original size).
+    local pre_rollback_size post_rollback_size base_size
+    base_size=$(stat -c%s "$BASE" 2>/dev/null || stat -f%z "$BASE" 2>/dev/null || echo 0)
     t0=$(now_ms)
-    out=$(bash "$SCRIPT" -f "$FILE" --rollback --yes --no-color 2>&1 || true)
+    out=$(large_run -f "$FILE" --rollback --yes --no-color 2>&1 || true)
     t1=$(now_ms)
     log_timing "31 large: --rollback" "$t0" "$t1"
     if echo "$out" | grep -qiE "(restored|rollback)"; then
         ok "rollback: success message present"
     else
-        fail "rollback: success message missing"
+        fail "rollback: success message missing (output: $(echo "$out" | tail -3))"
     fi
     lines_after=$(wc -l < "$FILE")
-    if (( lines_after == total_lines || lines_after == total_lines - 1 )); then
-        ok "rollback: file restored to a valid state"
+    if (( lines_after == total_lines )); then
+        ok "rollback: line count matches original"
     else
-        fail "rollback: unexpected line count $lines_after"
+        fail "rollback: expected $total_lines lines, got $lines_after"
+    fi
+    post_rollback_size=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
+    if (( post_rollback_size == base_size )); then
+        ok "rollback: byte size matches original ($base_size bytes)"
+    else
+        fail "rollback: byte size mismatch — original $base_size B, got $post_rollback_size B"
     fi
 
     echo ""
