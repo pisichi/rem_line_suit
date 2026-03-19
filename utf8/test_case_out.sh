@@ -81,12 +81,12 @@ setup_test_case() {
 
 # ================= HELPERS =================
 ok() {
-    echo -e "  ${GREEN}[PASS] [PASS]${RESET} $1"
+    echo -e "  ${GREEN}[PASS]${RESET} $1"
     ((PASS+=1)) || true
 }
 
 fail() {
-    echo -e "  ${RED}[FAIL] [FAIL]${RESET} $1"
+    echo -e "  ${RED}[FAIL]${RESET} $1"
     ((FAIL+=1)) || true
 }
 
@@ -1329,165 +1329,162 @@ test_large_file() {
     fi
 
     # =========================================================================
-    # STRESS TESTS: operations at 1 / 100 / 1000 hit scale
-    # Each sub-group gets a fresh copy. Timings show how the script scales.
-    # CHECKSUM=seq%9973 gives deterministic hit counts:
-    #   1 hit   : CHECKSUM=0001
-    #   100 hits: regex CHECKSUM=00[0-9]{2}  (0000-0099)
-    #   1000 hits: regex CHECKSUM=0[0-9]{3}  (0000-0999)
+    # STRESS TESTS: sparse / medium / dense match density
+    # Uses generator moduli for deterministic hit counts regardless of file size:
+    #   sparse : FLAG=X    every 3333rd line  (~total/3333 hits, ~0.03%)
+    #   medium : CORRUPT=1 every 2000th line  (~total/2000 hits, ~0.05%)
+    #   dense  : CAT=Z     every 1000th line  (~total/1000 hits, ~0.10%)
+    # -l delete always operates on exactly 1 line (exact position).
+    # All stress ops use --max-changes 0 (guard disabled — this IS a bulk test).
     # =========================================================================
 
-    # -- Stress -l: delete by line number at 1 / 100 / 1000 sequential lines --
-    echo ""
-    echo "  [Stress] -l delete: 1 / 100 / 1000 lines"
+    local sparse_pat="FLAG=X" medium_pat="CORRUPT=1" dense_pat="CAT=Z"
+    local sparse_est="~total/3333" medium_est="~total/2000" dense_est="~total/1000"
 
-    # 1 line
-    fresh_copy "stress -l 1"
+    # -- Stress -l: delete exact line near start / middle / end ----------------
+    echo ""
+    echo "  [Stress] -l delete: start / mid / end of file"
+
+    local near_start=$(( total_lines / 10 ))
+    local near_end=$(( total_lines * 9 / 10 ))
+
+    fresh_copy "stress -l near_start"
+    t0=$(now_ms)
+    large_run -f "$FILE" -l "$near_start" --yes --no-color --no-modified 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -l delete (near start, line $near_start)" "$t0" "$t1"
+    lines_after=$(wc -l < "$FILE")
+    if (( lines_after == total_lines - 1 )); then ok "stress -l start: line count correct"
+    else fail "stress -l start: expected $((total_lines-1)), got $lines_after"; fi
+
+    fresh_copy "stress -l mid"
     t0=$(now_ms)
     large_run -f "$FILE" -l "$mid_line" --yes --no-color --no-modified 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -l delete x1" "$t0" "$t1"
+    log_timing "31 stress: -l delete (mid, line $mid_line)" "$t0" "$t1"
     lines_after=$(wc -l < "$FILE")
-    if (( lines_after == total_lines - 1 )); then ok "stress -l x1: line count correct"
-    else fail "stress -l x1: expected $((total_lines-1)), got $lines_after"; fi
+    if (( lines_after == total_lines - 1 )); then ok "stress -l mid: line count correct"
+    else fail "stress -l mid: expected $((total_lines-1)), got $lines_after"; fi
 
-    # 100 lines (delete line 1000 through 1099 sequentially — each op sees a fresh file)
-    fresh_copy "stress -l 100 (single op)"
-    # Build a temp file of 100 line numbers and delete them in one -w pass
-    # (using -l in a loop would be 100 separate file rewrites — instead use -w with exact match)
-    # We use a regex on the CHECKSUM field to get ~100 hits in one pass
+    fresh_copy "stress -l near_end"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]$" --regex --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -l "$near_end" --yes --no-color --no-modified 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -l-equivalent delete x100 (regex CHECKSUM=00[0-9][0-9])" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then
-        ok "stress delete x100: footer valid"
-    else
-        fail "stress delete x100: footer invalid"
-    fi
+    log_timing "31 stress: -l delete (near end, line $near_end)" "$t0" "$t1"
+    lines_after=$(wc -l < "$FILE")
+    if (( lines_after == total_lines - 1 )); then ok "stress -l end: line count correct"
+    else fail "stress -l end: expected $((total_lines-1)), got $lines_after"; fi
 
-    # 1000 lines
-    fresh_copy "stress -l 1000 (single op)"
-    t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]$" --regex --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
-    t1=$(now_ms)
-    log_timing "31 stress: delete x1000 (regex CHECKSUM=0[0-9][0-9][0-9])" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then
-        ok "stress delete x1000: footer valid"
-    else
-        fail "stress delete x1000: footer invalid"
-    fi
-
-    # -- Stress -w keyword delete: 1 / 100 / 1000 hits -------------------------
+    # -- Stress -w delete: sparse / medium / dense match density ----------------
     echo ""
-    echo "  [Stress] -w delete: 1 / 100 / 1000 hits"
+    echo "  [Stress] -w delete: sparse ($sparse_pat) / medium ($medium_pat) / dense ($dense_pat)"
 
-    fresh_copy "stress -w x1"
+    fresh_copy "stress -w sparse"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0001" --yes --no-color         --no-modified --max-changes 5 2>/dev/null || true
+    large_run -f "$FILE" -w "$sparse_pat" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -w delete x1 (CHECKSUM=0001)" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w x1: footer valid"
-    else fail "stress -w x1: footer invalid"; fi
+    log_timing "31 stress: -w delete sparse ($sparse_pat, $sparse_est hits)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w sparse: footer valid"
+    else fail "stress -w sparse: footer invalid"; fi
 
-    fresh_copy "stress -w x100"
+    fresh_copy "stress -w medium"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "$medium_pat" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -w delete x100 (CHECKSUM=00NN)" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w x100: footer valid"
-    else fail "stress -w x100: footer invalid"; fi
+    log_timing "31 stress: -w delete medium ($medium_pat, $medium_est hits)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w medium: footer valid"
+    else fail "stress -w medium: footer invalid"; fi
 
-    fresh_copy "stress -w x1000"
+    fresh_copy "stress -w dense"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "$dense_pat" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -w delete x1000 (CHECKSUM=0NNN)" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w x1000: footer valid"
-    else fail "stress -w x1000: footer invalid"; fi
+    log_timing "31 stress: -w delete dense ($dense_pat, $dense_est hits)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w dense: footer valid"
+    else fail "stress -w dense: footer invalid"; fi
 
-    # -- Stress -w --regex --pos: 1 / 100 / 1000 hits --------------------------
+    # -- Stress -w --regex --pos delete: sparse / medium / dense ---------------
     echo ""
-    echo "  [Stress] -w --regex --pos delete: 1 / 100 / 1000 hits"
-    # CHECKSUM field starts after |PAD=...<460 chars>| — it's near end of line.
-    # CHECKSUM value pos varies 518-535 by line number; use 515-540 to cover all cases.
+    echo "  [Stress] -w --regex --pos delete: sparse / medium / dense"
+    # CAT field is at a fixed early column; use --pos 14-18 (covers 'CAT=Z' exactly).
+    # CORRUPT and FLAG fields also in fixed positions relative to CAT.
+    # Use --pos 14-25 to cover CAT= and FLAG= area without scanning the whole line.
 
-    fresh_copy "stress -w --regex --pos x1"
+    fresh_copy "stress regex+pos sparse"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0001" --regex --pos 515-540         --yes --no-color --no-modified --max-changes 5 2>/dev/null || true
+    large_run -f "$FILE" -w "FLAG=X" --regex --pos 32-38         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -w --regex --pos delete x1" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x1: footer valid"
-    else fail "stress regex+pos x1: footer invalid"; fi
+    log_timing "31 stress: -w --regex --pos sparse (FLAG=X)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos sparse: footer valid"
+    else fail "stress regex+pos sparse: footer invalid"; fi
 
-    fresh_copy "stress -w --regex --pos x100"
+    fresh_copy "stress regex+pos medium"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --regex --pos 515-540         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "CAT=Z" --regex --pos 14-18         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -w --regex --pos delete x100" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x100: footer valid"
-    else fail "stress regex+pos x100: footer invalid"; fi
+    log_timing "31 stress: -w --regex --pos medium (CAT=Z)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos medium: footer valid"
+    else fail "stress regex+pos medium: footer invalid"; fi
 
-    fresh_copy "stress -w --regex --pos x1000"
+    fresh_copy "stress regex+pos dense"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --regex --pos 515-540         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "CAT=[ABCD]" --regex --pos 14-18         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: -w --regex --pos delete x1000" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x1000: footer valid"
-    else fail "stress regex+pos x1000: footer invalid"; fi
+    log_timing "31 stress: -w --regex --pos dense (CAT=[ABCD])" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos dense: footer valid"
+    else fail "stress regex+pos dense: footer invalid"; fi
 
-    # -- Stress replace: 1 / 100 / 1000 hits -----------------------------------
+    # -- Stress replace: sparse / medium / dense --------------------------------
     echo ""
-    echo "  [Stress] replace: 1 / 100 / 1000 hits"
+    echo "  [Stress] replace: sparse / medium / dense"
 
-    fresh_copy "stress replace x1"
+    fresh_copy "stress replace sparse"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0001" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 5 2>/dev/null || true
+    large_run -f "$FILE" -w "$sparse_pat" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: replace x1 (CHECKSUM=0001)" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace x1: footer valid"
-    else fail "stress replace x1: footer invalid"; fi
+    log_timing "31 stress: replace sparse ($sparse_pat, $sparse_est hits)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace sparse: footer valid"
+    else fail "stress replace sparse: footer invalid"; fi
 
-    fresh_copy "stress replace x100"
+    fresh_copy "stress replace medium"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "$medium_pat" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: replace x100 (CHECKSUM=00NN)" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace x100: footer valid"
-    else fail "stress replace x100: footer invalid"; fi
+    log_timing "31 stress: replace medium ($medium_pat, $medium_est hits)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace medium: footer valid"
+    else fail "stress replace medium: footer invalid"; fi
 
-    fresh_copy "stress replace x1000"
+    fresh_copy "stress replace dense"
     t0=$(now_ms)
-    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    large_run -f "$FILE" -w "$dense_pat" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
     t1=$(now_ms)
-    log_timing "31 stress: replace x1000 (CHECKSUM=0NNN)" "$t0" "$t1"
-    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace x1000: footer valid"
-    else fail "stress replace x1000: footer invalid"; fi
+    log_timing "31 stress: replace dense ($dense_pat, $dense_est hits)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace dense: footer valid"
+    else fail "stress replace dense: footer invalid"; fi
 
     # -- Op 7: Max-changes guard fires on a broad pattern ----------------------
-    # Note: no fresh_copy here — we test on the current file (post-merge).
-    # fresh_copy would delete the backup that Op 6 created, breaking rollback.
+    # fresh_copy resets to BASE (total_lines) and clears any backup.
+    # Guard test then runs on the clean BASE file — abort leaves it at total_lines.
+    fresh_copy "max-changes guard"
     out=$(large_run -f "$FILE" -w "FLAG=Y" --yes --no-color --max-changes 10 2>&1 || true)
     if echo "$out" | grep -qiE "(MAX_CHANGES|Aborting|too many|unintended)"; then
         ok "max-changes guard: aborts broad pattern correctly"
     else
         fail "max-changes guard: should have aborted"
     fi
-    # File must be untouched (aborted before any write)
     lines_after=$(wc -l < "$FILE")
-    if (( lines_after == total_lines - 1 )); then
-        ok "max-changes guard: file unchanged after abort (still post-merge)"
+    if (( lines_after == total_lines )); then
+        ok "max-changes guard: file unchanged after abort"
     else
         fail "max-changes guard: unexpected line count $lines_after after abort"
     fi
 
     # -- Op 8: Rollback --------------------------------------------------------
-    # Backup was created by Op 6 (merge-next) and preserved — fresh_copy was
-    # intentionally skipped in Op 7 so the backup still exists here.
-    # The backup was taken from the BASE (pre-merge), so rollback should restore
-    # the file to total_lines (full original size).
-    local pre_rollback_size post_rollback_size base_size
+    # fresh_copy above deleted the backup. Create a known backup by running a
+    # single -l delete, then rollback to verify the restore is byte-exact.
+    local base_size
     base_size=$(stat -c%s "$BASE" 2>/dev/null || stat -f%z "$BASE" 2>/dev/null || echo 0)
+    large_run -f "$FILE" -l "$mid_line" --yes --no-color --no-modified 2>/dev/null || true
     t0=$(now_ms)
     out=$(large_run -f "$FILE" --rollback --yes --no-color 2>&1 || true)
     t1=$(now_ms)
@@ -1503,6 +1500,7 @@ test_large_file() {
     else
         fail "rollback: expected $total_lines lines, got $lines_after"
     fi
+    local post_rollback_size
     post_rollback_size=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null || echo 0)
     if (( post_rollback_size == base_size )); then
         ok "rollback: byte size matches original ($base_size bytes)"
