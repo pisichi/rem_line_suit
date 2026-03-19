@@ -1328,6 +1328,142 @@ test_large_file() {
         fail "merge-next: footer changed unexpectedly"
     fi
 
+    # =========================================================================
+    # STRESS TESTS: operations at 1 / 100 / 1000 hit scale
+    # Each sub-group gets a fresh copy. Timings show how the script scales.
+    # CHECKSUM=seq%9973 gives deterministic hit counts:
+    #   1 hit   : CHECKSUM=0001
+    #   100 hits: regex CHECKSUM=00[0-9]{2}  (0000-0099)
+    #   1000 hits: regex CHECKSUM=0[0-9]{3}  (0000-0999)
+    # =========================================================================
+
+    # -- Stress -l: delete by line number at 1 / 100 / 1000 sequential lines --
+    echo ""
+    echo "  [Stress] -l delete: 1 / 100 / 1000 lines"
+
+    # 1 line
+    fresh_copy "stress -l 1"
+    t0=$(now_ms)
+    large_run -f "$FILE" -l "$mid_line" --yes --no-color --no-modified 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -l delete x1" "$t0" "$t1"
+    lines_after=$(wc -l < "$FILE")
+    if (( lines_after == total_lines - 1 )); then ok "stress -l x1: line count correct"
+    else fail "stress -l x1: expected $((total_lines-1)), got $lines_after"; fi
+
+    # 100 lines (delete line 1000 through 1099 sequentially — each op sees a fresh file)
+    fresh_copy "stress -l 100 (single op)"
+    # Build a temp file of 100 line numbers and delete them in one -w pass
+    # (using -l in a loop would be 100 separate file rewrites — instead use -w with exact match)
+    # We use a regex on the CHECKSUM field to get ~100 hits in one pass
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]$" --regex --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -l-equivalent delete x100 (regex CHECKSUM=00[0-9][0-9])" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then
+        ok "stress delete x100: footer valid"
+    else
+        fail "stress delete x100: footer invalid"
+    fi
+
+    # 1000 lines
+    fresh_copy "stress -l 1000 (single op)"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]$" --regex --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: delete x1000 (regex CHECKSUM=0[0-9][0-9][0-9])" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then
+        ok "stress delete x1000: footer valid"
+    else
+        fail "stress delete x1000: footer invalid"
+    fi
+
+    # -- Stress -w keyword delete: 1 / 100 / 1000 hits -------------------------
+    echo ""
+    echo "  [Stress] -w delete: 1 / 100 / 1000 hits"
+
+    fresh_copy "stress -w x1"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0001" --yes --no-color         --no-modified --max-changes 5 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -w delete x1 (CHECKSUM=0001)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w x1: footer valid"
+    else fail "stress -w x1: footer invalid"; fi
+
+    fresh_copy "stress -w x100"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -w delete x100 (CHECKSUM=00NN)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w x100: footer valid"
+    else fail "stress -w x100: footer invalid"; fi
+
+    fresh_copy "stress -w x1000"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --yes --no-color         --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -w delete x1000 (CHECKSUM=0NNN)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress -w x1000: footer valid"
+    else fail "stress -w x1000: footer invalid"; fi
+
+    # -- Stress -w --regex --pos: 1 / 100 / 1000 hits --------------------------
+    echo ""
+    echo "  [Stress] -w --regex --pos delete: 1 / 100 / 1000 hits"
+    # CHECKSUM field starts after |PAD=...<460 chars>| — it's near end of line.
+    # Use --pos scoped to last 20 chars of the ~520-char line: pos 501-520.
+
+    fresh_copy "stress -w --regex --pos x1"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0001" --regex --pos 501-520         --yes --no-color --no-modified --max-changes 5 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -w --regex --pos delete x1" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x1: footer valid"
+    else fail "stress regex+pos x1: footer invalid"; fi
+
+    fresh_copy "stress -w --regex --pos x100"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --regex --pos 501-520         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -w --regex --pos delete x100" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x100: footer valid"
+    else fail "stress regex+pos x100: footer invalid"; fi
+
+    fresh_copy "stress -w --regex --pos x1000"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --regex --pos 501-520         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: -w --regex --pos delete x1000" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress regex+pos x1000: footer valid"
+    else fail "stress regex+pos x1000: footer invalid"; fi
+
+    # -- Stress replace: 1 / 100 / 1000 hits -----------------------------------
+    echo ""
+    echo "  [Stress] replace: 1 / 100 / 1000 hits"
+
+    fresh_copy "stress replace x1"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0001" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 5 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: replace x1 (CHECKSUM=0001)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace x1: footer valid"
+    else fail "stress replace x1: footer invalid"; fi
+
+    fresh_copy "stress replace x100"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=00[0-9][0-9]" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: replace x100 (CHECKSUM=00NN)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace x100: footer valid"
+    else fail "stress replace x100: footer invalid"; fi
+
+    fresh_copy "stress replace x1000"
+    t0=$(now_ms)
+    large_run -f "$FILE" -w "CHECKSUM=0[0-9][0-9][0-9]" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color --no-modified --max-changes 0 2>/dev/null || true
+    t1=$(now_ms)
+    log_timing "31 stress: replace x1000 (CHECKSUM=0NNN)" "$t0" "$t1"
+    if get_footer "$FILE" | grep -qE '^FOOTERTEST[0-9]{8}$'; then ok "stress replace x1000: footer valid"
+    else fail "stress replace x1000: footer invalid"; fi
+
     # -- Op 7: Max-changes guard fires on a broad pattern ----------------------
     # Note: no fresh_copy here — we test on the current file (post-merge).
     # fresh_copy would delete the backup that Op 6 created, breaking rollback.
