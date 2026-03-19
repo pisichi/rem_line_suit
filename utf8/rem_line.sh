@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
- 
+
 # ================= EXIT CODES =================
 EXIT_SUCCESS=0
 EXIT_FAILURE=1
 EXIT_USAGE=2
- 
+
 # ================= COLORS =================
 RED='\033[31;1m'
 YELLOW='\033[33;1m'
 GREEN='\033[32;1m'
 RESET='\033[0m'
- 
+
 # ================= CONFIGURATION =================
 PREVIEW_LIMIT=10
 REGEX_MODE=0
@@ -23,38 +23,38 @@ NO_HEADER_FOOTER=0
 MERGE_NEXT=0
 NO_MODIFIED=0
 DEFAULT_FILE="./data.txt"
- 
+
 # Abort if a -w operation matches more than this many lines.
 # Protects against accidentally broad patterns. 0 = unlimited.
 MAX_CHANGES=100
- 
+
 POS_START=""
 POS_END=""
 REPLACE_MODE=0
 REPLACE_POS=""
 REPLACE_TXT=""
- 
+
 FILE=""
 LINE_NUM=""
 WORD=""
 ROLLBACK=0
- 
+
 HEADER_LINE_NUM=1
 FOOTER_PATTERN="^FOOTERTEST[0-9]+$"
 FOOTER_PREFIX="FOOTERTEST"
 FOOTER_NUM_FORMAT="%08d"
- 
+
 # Runtime caches — set by validate_footer, consumed by downstream functions
 CACHED_TOTAL=""
 CACHED_FOOTER_NUM=""
- 
+
 # ================= ALLOWED PATHS =================
 # Leave empty to allow any path. Populated paths are resolved (symlinks
 # expanded) before checking so symlink traversal cannot bypass the list.
 ALLOWED_PATHS=(
     # "/data/reports"
 )
- 
+
 # ================= AWK / LOCALE SETUP =================
 # gawk + C.UTF-8: character-aware substr/length/index for --pos.
 # mawk (Ubuntu default): always byte-based regardless of locale.
@@ -69,25 +69,25 @@ else
     MAWK_BYTE_MODE=1
 fi
 MAWK_BYTE_MODE=${MAWK_BYTE_MODE:-0}
- 
+
 # Reusable awk snippet: extract the search segment (respecting --pos),
 # then test for a match. Expands to two awk lines used in every search block.
 # Variables required in scope: w, s, e, regex
 AWK_SEG_MATCH='seg = (s && e) ? substr($0, s, e-s+1) : $0
             matched = regex ? match(seg, w) : index(seg, w)'
- 
+
 # ================= TEMP FILE MANAGEMENT =================
 TEMP_FILES=()
 cleanup_temp() { for f in "${TEMP_FILES[@]}"; do [[ -f "$f" ]] && rm -f "$f"; done; }
 trap cleanup_temp EXIT INT TERM
- 
+
 make_temp() {
     local tmp
     tmp=$(mktemp -p "$(dirname "$1")" ".tmp.XXXXXXXXXX") || err "Cannot create temp file"
     TEMP_FILES+=("$tmp")
     echo "$tmp"
 }
- 
+
 # ================= SMALL HELPERS =================
 err() { echo "Error: $1" >&2; exit "${2:-$EXIT_FAILURE}"; }
 info() { (( NO_COLOR )) && echo "$*" || echo -e "${GREEN}$*${RESET}"; }
@@ -96,7 +96,7 @@ confirm() {
     read -r -p "$1 (y/n): " ans
     [[ "$ans" =~ ^[yY]$ ]]
 }
- 
+
 # Assert file exists, is readable, and (optionally) writable.
 # Usage: assert_file_rw "$file"        (r/w)
 #        assert_file_rw "$file" ro     (read-only)
@@ -107,7 +107,7 @@ assert_file_rw() {
     [[ "$mode" == ro ]] && return 0
     [[ -w "$file" ]] || err "File not writable: $file"
 }
- 
+
 # Abort if available disk space < 2× file size (backup + temp needed).
 check_disk_space() {
     local file="$1"
@@ -119,7 +119,7 @@ check_disk_space() {
     (( dir_free > file_size * 2 )) \
         || err "Insufficient disk space. Need $(( file_size*2/1024/1024 ))MB, have $(( dir_free/1024/1024 ))MB"
 }
- 
+
 # Consume CACHED_TOTAL or fall back to wc -l. Clears the cache.
 consume_total() {
     local file="$1"
@@ -127,67 +127,19 @@ consume_total() {
     CACHED_TOTAL=""
     echo "$total"
 }
- 
+
 # ================= REGEX SAFETY =================
 validate_regex() {
     timeout 2s awk "BEGIN { if (match(\"test\", \"$1\")) print \"ok\" }" 2>/dev/null \
         || err "Regex pattern is invalid or too slow (potential ReDoS): $1"
 }
- 
+
 # ================= CHANGE LIMIT GUARD =================
 check_max_changes() {
     (( MAX_CHANGES == 0 || $1 <= MAX_CHANGES )) && return 0
     err "$2: $1 lines matched, but MAX_CHANGES=$MAX_CHANGES.\n  Use a more specific pattern, or raise MAX_CHANGES if intentional."
 }
- 
-# ================= ENCODING HANDLING =================
-# Detects the file's character encoding and, when the -w search term contains
-# non-ASCII UTF-8 bytes, converts it to match the file's encoding so awk can
-# find it with byte-level matching.  Preview output is piped back through iconv
-# to UTF-8 so the terminal always shows readable text.
-# A warning is shown once when a conversion is applied.
- 
-FILE_ENCODING=""        # set by detect_file_encoding; consumed by callers
-ENCODING_CONVERTED=0   # 1 if WORD was re-encoded for the file
- 
-# Map `file` command output to an iconv encoding name.
-# Returns empty string if encoding is unknown or UTF-8-compatible.
-detect_file_encoding() {
-    local file_out
-    file_out=$(file "$1" 2>/dev/null | sed 's/^[^:]*: //')
-    case "$file_out" in
-        *UTF-8*|*"ASCII text"*) echo "UTF-8" ;;
-        *ISO-8859*)             echo "ISO-8859-1" ;;
-        *"Non-ISO extended-ASCII"*|*Windows*|*CP125*) echo "CP1252" ;;
-        *EBCDIC*)               echo "EBCDIC-CP-US" ;;
-        *)                      echo "" ;;
-    esac
-}
- 
-# Return 1 if string contains any byte > 0x7F (i.e. non-ASCII).
-has_non_ascii() { printf '%s' "$1" | grep -qP '[^-]'; }
- 
-# Convert a string from UTF-8 to the target encoding.
-# Echoes the original string unchanged if iconv is unavailable or conversion fails.
-encode_word() {
-    local word="$1" target_enc="$2"
-    [[ -z "$target_enc" || "$target_enc" == "UTF-8" ]] && { echo "$word"; return; }
-    command -v iconv >/dev/null 2>&1 || { echo "$word"; return; }
-    local converted
-    converted=$(printf '%s' "$word" | iconv -f UTF-8 -t "$target_enc" 2>/dev/null)         && echo "$converted" || echo "$word"
-}
- 
-# Pipe stdin from file encoding to UTF-8 for terminal display.
-# No-op if encoding is UTF-8/empty or iconv unavailable.
-decode_for_display() {
-    local src_enc="$1"
-    if [[ -z "$src_enc" || "$src_enc" == "UTF-8" ]] || ! command -v iconv >/dev/null 2>&1; then
-        cat
-    else
-        iconv -f "$src_enc" -t UTF-8 2>/dev/null || cat
-    fi
-}
- 
+
 # ================= LARGE FILE HANDLING =================
 validate_file_size() {
     local size
@@ -196,7 +148,7 @@ validate_file_size() {
         && info "WARNING: File is very large ($(( size/1024/1024/1024 ))GB). Operations may take a while." >&2
     return 0
 }
- 
+
 # ================= PATH ALLOWLIST =================
 validate_allowed_path() {
     (( ${#ALLOWED_PATHS[@]} == 0 )) && return 0
@@ -210,7 +162,7 @@ validate_allowed_path() {
     done
     err "Path not allowed: $real_path\n  Permitted:$(printf '\n    %s' "${ALLOWED_PATHS[@]}")" "$EXIT_USAGE"
 }
- 
+
 # ================= FILE INFO =================
 show_file_info() {
     local file="$1"
@@ -229,8 +181,6 @@ show_file_info() {
     encoding=$(file "$file" 2>/dev/null | sed 's/^[^:]*: //; s/, with CRLF line terminators//')
     head -c 4096 "$file" | grep -qP "\r" 2>/dev/null         && line_ending="CRLF" || line_ending="LF"
     local file_type="${encoding}, ${line_ending}"
-    # Cache detected iconv encoding for search word conversion
-    FILE_ENCODING=$(detect_file_encoding "$file")
     if (( NO_COLOR )); then
         printf -- "---\n  File: %s\n  Size: %s  (%s lines)\n  Type: %s\n---\n" \
             "$file" "$size_str" "$total" "$file_type"
@@ -242,32 +192,32 @@ show_file_info() {
         echo -e "${YELLOW}---${RESET}"
     fi
 }
- 
+
 # ================= HELP =================
 show_help() {
     cat << 'EOF'
 Usage: script.sh [OPTIONS]
- 
+
 Delete or replace lines in a structured file with header and footer.
- 
+
 MODES:
   -l LINE_NUM              Delete a specific line number
   -l LINE_NUM --merge-next Merge LINE_NUM with the following line
   -w WORD                  Search and delete/replace lines containing WORD
   --rollback               Restore file from backup
- 
+
 SEARCH OPTIONS:
   --pos START-END          Search only within character positions START to END
   --regex                  Treat search WORD as a regex pattern
- 
+
 REPLACE MODE (requires -w):
   --replace-pos START-END  Character positions to replace in matched lines
   --replace-txt TEXT       Replacement text
- 
+
 FILE OPTIONS:
   -f FILE                  File to operate on (default: ./data.txt)
   -n NUM                   Preview limit for matches (default: 10)
- 
+
 CONTROL OPTIONS:
   --merge-next             Merge the target line (-l) with the line below it.
                            Footer is NOT updated (merge repairs corruption).
@@ -281,22 +231,22 @@ CONTROL OPTIONS:
   --no-modified            Skip saving deleted/replaced lines to a _modified_*
                            file. Eliminates one extra scan on large files.
   --force                  (Reserved for future use)
- 
+
 NOTES:
   - Header (line 1) and footer (last line) are protected from modification
   - Footer must match pattern: FOOTERTEST########
   - Backups are created as <filename>_backup
   - Install gawk for character-accurate --pos with UTF-8/multibyte content
- 
+
 EXIT CODES:
   0  Success (or user declined confirmation)
   1  Failure
   2  Usage error
- 
+
 EOF
     exit "$EXIT_SUCCESS"
 }
- 
+
 # ================= FOOTER VALIDATION =================
 # Both functions echo the total line count for CACHED_TOTAL.
 validate_file() {
@@ -311,7 +261,7 @@ validate_file() {
     fi
     echo "$total"
 }
- 
+
 validate_footer() {
     local file="$1"
     if (( NO_HEADER_FOOTER )); then validate_file "$file"; return 0; fi
@@ -325,10 +275,10 @@ validate_footer() {
     info "Footer validation passed: $footer" >&2
     echo "$total"
 }
- 
+
 # ================= BACKUP =================
 get_backup_name() { echo "${1}_backup"; }
- 
+
 create_backup() {
     local file="$1" backup
     backup=$(get_backup_name "$file")
@@ -357,7 +307,7 @@ create_backup() {
     fi
     echo "$backup"
 }
- 
+
 rollback_file() {
     local file="$1" backup
     backup=$(get_backup_name "$file")
@@ -370,7 +320,7 @@ rollback_file() {
     cp -p "$backup" "$file" || err "Rollback failed"
     info "Restored from backup: $backup"
 }
- 
+
 # ================= FOOTER ARITHMETIC =================
 compute_footer() {
     local file="$1" deleted="$2" num new
@@ -386,7 +336,7 @@ compute_footer() {
     (( new >= 0 )) || err "Footer would be negative: $num - $deleted = $new"
     printf "${FOOTER_PREFIX}${FOOTER_NUM_FORMAT}" "$new"
 }
- 
+
 # ================= PREVIEW =================
 preview_line() {
     local file="$1" line="$2"
@@ -406,7 +356,7 @@ preview_line() {
         }
         NR > e { exit }' "$file"
 }
- 
+
 preview_replacements() {
     local file="$1" word="$2" rs="$3" re="$4" rtxt="$5"
     echo "Replacement preview (up to $PREVIEW_LIMIT):"
@@ -428,14 +378,14 @@ preview_replacements() {
         }
         END { if (shown==0) { print "No matches found"; exit 1 } }' "$file"
 }
- 
+
 # ================= FIND MATCHING LINES =================
 find_matches() {
     $AWK_CMD -v w="$1" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" '
         { seg = (s&&e) ? substr($0,s,e-s+1) : $0
           if (regex ? match(seg,w) : index(seg,w)) print NR }' "$2"
 }
- 
+
 # ================= WRITE MODIFIED LINES =================
 # Single awk pass, exits after the highest needed line.
 write_modified() {
@@ -455,7 +405,7 @@ write_modified() {
     rm -f "$lf"
     echo "$out"
 }
- 
+
 # ================= DELETE LINES =================
 delete_lines() {
     local file="$1"; shift
@@ -463,15 +413,15 @@ delete_lines() {
     assert_file_rw "$file"
     (( ${#lines[@]} )) || err "No lines to delete"
     check_disk_space "$file"
- 
+
     local tmp_sort; tmp_sort=$(make_temp "$file")
     printf '%s\n' "${lines[@]}" | sort -n -u > "$tmp_sort"
     local -a uniq; mapfile -t uniq < "$tmp_sort"; rm -f "$tmp_sort"
- 
+
     local total; total=$(consume_total "$file")
     local -a filtered skipped_lines
     local skipped_header=0 skipped_footer=0
- 
+
     for L in "${uniq[@]}"; do
         [[ "$L" =~ ^[0-9]+$ ]] || err "Invalid line number: $L"
         (( L >= 1 && L <= total )) || err "Line $L out of range (1-$total)"
@@ -484,28 +434,28 @@ delete_lines() {
             filtered+=("$L")
         fi
     done
- 
+
     (( skipped_header || skipped_footer )) && info "Skipped protected lines: ${skipped_lines[*]}"
     if (( ${#filtered[@]} == 0 )); then info "No lines to delete after filtering protected lines"; return 0; fi
- 
+
     info "Will delete ${#filtered[@]} line(s)"
     check_max_changes "${#filtered[@]}" "Delete"
- 
+
     if (( DRY_RUN )); then
         (( ! NO_HEADER_FOOTER )) && info "[DRY-RUN] New footer: $(compute_footer "$file" "${#filtered[@]}")"
         return 0
     fi
     confirm "Delete these lines?" || return
- 
+
     local backup modified tmp
     backup=$(create_backup "$file") || err "Failed to create backup"
     modified=$( (( NO_MODIFIED )) && echo "" || write_modified "$file" "${filtered[@]}" )
     tmp=$(make_temp "$file")
- 
+
     local lf; lf=$(make_temp "$file")
     printf '%s\n' "${filtered[@]}" > "$lf"
     info "Processing..." >&2
- 
+
     if (( NO_HEADER_FOOTER )); then
         $AWK_CMD -v lf="$lf" '
             BEGIN { while ((getline ln < lf) > 0) del[ln]=1 }
@@ -523,14 +473,14 @@ delete_lines() {
             END { print nf }
         ' "$file" > "$tmp" || { rm -f "$tmp" "$lf"; err "Failed to build new file"; }
     fi
- 
+
     rm -f "$lf"
     mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write changes (restored from backup)"; }
     info "Deleted ${#filtered[@]} lines"
     (( ! NO_HEADER_FOOTER )) && info "Footer updated to: $new_footer"
     [[ -n "$modified" ]] && info "Modified lines saved: $modified"
 }
- 
+
 # ================= REPLACE TEXT =================
 replace_lines() {
     local file="$1" word="$2" rs="$3" re="$4" rtxt="$5"
@@ -538,12 +488,12 @@ replace_lines() {
     [[ "$rs" =~ ^[0-9]+$ && "$re" =~ ^[0-9]+$ ]] || err "Replace positions must be numbers"
     (( rs >= 1 && re >= rs )) || err "Invalid replace range: $rs-$re"
     check_disk_space "$file"
- 
+
     local total; total=$(consume_total "$file")
     local awk_header awk_footer
     (( NO_HEADER_FOOTER )) && { awk_header=0; awk_footer=0; } \
                            || { awk_header="$HEADER_LINE_NUM"; awk_footer="$total"; }
- 
+
     # Count matches with early exit — stops scanning as soon as MAX_CHANGES+1
     # is hit so we never read the full file just to trigger the guard.
     local match_count
@@ -558,16 +508,16 @@ replace_lines() {
         }
         END { print n }
     ' "$file")
- 
+
     (( match_count > 0 )) || { echo "Error: No matches found" >&2; return 1; }
     check_max_changes "$match_count" "Replace"
- 
+
     if (( DRY_RUN )); then
         info "[DRY-RUN] Would replace text in $match_count line(s)"; return 0
     fi
     info "Found $match_count line(s) to replace"
     confirm "Replace text in $match_count lines?" || return
- 
+
     local backup tmp modified_out cnt_file
     backup=$(create_backup "$file")     || err "Failed to create backup"
     tmp=$(make_temp "$file")            || err "Failed to create temp file"
@@ -575,7 +525,7 @@ replace_lines() {
     (( NO_MODIFIED )) && modified_out="/dev/null" \
                       || modified_out="${file}_modified_$(date +%Y%m%d%H%M%S)"
     info "Processing..." >&2
- 
+
     $AWK_CMD \
         -v w="$word" -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
         -v rs="$rs"  -v re="$re"       -v rtxt="$rtxt" \
@@ -597,7 +547,7 @@ replace_lines() {
         }
         END { print replaced > cntfile }
     ' "$file" > "$tmp" || { rm -f "$tmp" "$modified_out" "$cnt_file"; err "Failed to replace"; }
- 
+
     local actual_replaced=0
     [[ -s "$cnt_file" ]] && actual_replaced=$(cat "$cnt_file")
     rm -f "$cnt_file"
@@ -605,7 +555,7 @@ replace_lines() {
     info "Replaced text in $actual_replaced line(s)"
     (( ! NO_MODIFIED )) && [[ -f "$modified_out" ]] && info "Modified lines saved: $modified_out"
 }
- 
+
 # ================= MERGE LINE WITH NEXT =================
 merge_line_with_next() {
     local file="$1" line="$2"
@@ -615,7 +565,7 @@ merge_line_with_next() {
         (( line == HEADER_LINE_NUM )) && err "Cannot merge header line"
         (( line+1 == total )) && err "Cannot merge: next line ($((line+1))) is the footer (protected)"
     fi
- 
+
     echo "Merge preview:"
     $AWK_CMD -v t="$line" -v R="$RED" -v G="$GREEN" -v Y="$YELLOW" -v X="$RESET" -v nc="$NO_COLOR" '
         NR == t {
@@ -632,66 +582,48 @@ merge_line_with_next() {
             }
             exit
         }' "$file"
- 
+
     if (( DRY_RUN )); then
         info "[DRY-RUN] Footer unchanged (merge repairs a split record, not removes one)"
         return 0
     fi
     confirm "Merge line $line with line $((line+1))?" || return
- 
+
     local backup tmp
     backup=$(create_backup "$file") || err "Failed to create backup"
     tmp=$(make_temp "$file")        || err "Failed to create temp file"
     info "Processing..." >&2
- 
+
     # Strip \r from first fragment only — preserves the file's native line ending.
     $AWK_CMD -v t="$line" '
         NR==t { sub(/\r$/,"",$0); merged=$0; getline; print merged $0; next }
         { print }
     ' "$file" > "$tmp" || { rm -f "$tmp"; err "Failed to merge lines"; }
- 
+
     mv "$tmp" "$file" || { cp -p "$backup" "$file"; err "Failed to write (restored from backup)"; }
     info "Merged line $line with line $((line+1))"
 }
- 
+
 # ================= KEYWORD SEARCH =================
 keyword_search() {
     local file="$1" word="$2"
     [[ -n "$word" ]] || err "Search word cannot be empty"
- 
-    # If file is non-UTF8 and the search word contains non-ASCII bytes (typed in
-    # UTF-8 on a modern terminal), convert the word to the file's encoding so awk
-    # can match it byte-for-byte.  A warning is shown once.
-    local search_word="$word"
-    if [[ -n "$FILE_ENCODING" && "$FILE_ENCODING" != "UTF-8" ]]         && has_non_ascii "$word"; then
-        search_word=$(encode_word "$word" "$FILE_ENCODING")
-        if [[ "$search_word" != "$word" ]]; then
-            info "WARNING: File encoding is $FILE_ENCODING. Search term converted for matching. Preview will be decoded to UTF-8." >&2
-            ENCODING_CONVERTED=1
-        fi
-    fi
- 
-    (( REGEX_MODE )) && validate_regex "$search_word"
- 
+    (( REGEX_MODE )) && validate_regex "$word"
+
     if (( REPLACE_MODE )); then
         local rs re
         IFS='-' read -r rs re <<< "$REPLACE_POS"
         [[ -n "$rs" && -n "$re" ]] || err "--replace-pos format: start-end" "$EXIT_USAGE"
-        # Preview uses search_word for matching; display is decoded back to UTF-8
-        { preview_replacements "$file" "$search_word" "$rs" "$re" "$REPLACE_TXT" || return 1; }             | decode_for_display "$FILE_ENCODING"
-        # Replace: search with converted word; replacement text stays as-is
-        # (user is responsible for providing replacement in the correct encoding,
-        # or it is ASCII-only which works in any encoding)
-        replace_lines "$file" "$search_word" "$rs" "$re" "$REPLACE_TXT"
+        preview_replacements "$file" "$word" "$rs" "$re" "$REPLACE_TXT" || return 1
+        replace_lines "$file" "$word" "$rs" "$re" "$REPLACE_TXT"
         return
     fi
- 
+
     # Single pass: show preview AND collect match line numbers.
     local tmp_matches; tmp_matches=$(make_temp "$file")
     echo "Matches (up to $PREVIEW_LIMIT):"
-    {
     $AWK_CMD \
-        -v w="$search_word" -v limit="$PREVIEW_LIMIT" \
+        -v w="$word" -v limit="$PREVIEW_LIMIT" \
         -v s="$POS_START" -v e="$POS_END" -v regex="$REGEX_MODE" \
         -v R="$RED" -v X="$RESET" -v nc="$NO_COLOR" \
         -v matchfile="$tmp_matches" -v maxchg="$MAX_CHANGES" '
@@ -728,8 +660,7 @@ keyword_search() {
             if (shown==0)    { print "No matches found"; exit 1 }
             if (shown > limit) { print "... +"(shown-limit)" more" }
         }' "$file"
-    } | decode_for_display "$FILE_ENCODING"
- 
+
     local awk_rc=$?
     if (( awk_rc == 2 )); then
         rm -f "$tmp_matches"
@@ -739,7 +670,7 @@ keyword_search() {
     local -a match_lines; mapfile -t match_lines < "$tmp_matches"; rm -f "$tmp_matches"
     delete_lines "$file" "${match_lines[@]}"
 }
- 
+
 # ================= ARGUMENT PARSING =================
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -770,9 +701,9 @@ while [[ $# -gt 0 ]]; do
         *) err "Unknown option: $1" "$EXIT_USAGE" ;;
     esac
 done
- 
+
 FILE=${FILE:-$DEFAULT_FILE}
- 
+
 # ================= ARGUMENT VALIDATION =================
 if (( REPLACE_MODE )); then
     [[ -n "$REPLACE_POS" ]] || err "Replace mode requires --replace-pos" "$EXIT_USAGE"
@@ -783,20 +714,20 @@ if (( MERGE_NEXT )); then
     [[ -n "$LINE_NUM" ]] || err "--merge-next requires -l <line_num>" "$EXIT_USAGE"
     (( REPLACE_MODE )) && err "--merge-next cannot be combined with --replace-pos/--replace-txt" "$EXIT_USAGE"
 fi
- 
+
 # ================= MAIN =================
 if (( ROLLBACK )); then rollback_file "$FILE"; exit "$EXIT_SUCCESS"; fi
- 
+
 [[ -f "$FILE" ]] || err "File not found: $FILE"
 validate_allowed_path "$FILE"
 validate_file_size "$FILE"
- 
+
 if [[ -n "$LINE_NUM" || -n "$WORD" ]]; then
     CACHED_TOTAL=$(validate_footer "$FILE")
 fi
- 
+
 show_file_info "$FILE"
- 
+
 if [[ -n "$LINE_NUM" ]]; then
     if (( MERGE_NEXT )); then
         merge_line_with_next "$FILE" "$LINE_NUM"
@@ -807,11 +738,10 @@ if [[ -n "$LINE_NUM" ]]; then
     fi
     exit "$EXIT_SUCCESS"
 fi
- 
+
 if [[ -n "$WORD" ]]; then
     keyword_search "$FILE" "$WORD" || exit "$EXIT_FAILURE"
     exit "$EXIT_SUCCESS"
 fi
- 
+
 err "Provide either -l <line_num> or -w <word>" "$EXIT_USAGE"
- 
