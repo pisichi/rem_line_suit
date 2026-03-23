@@ -395,8 +395,8 @@ test_replace_preview() {
 
     local out
     out=$(run_cmd -f "$FILE" -w ERROR --replace-pos 1-8 --replace-txt RESOLVED --dry-run --yes --no-color)
-    assert_output "shows original lines"    "Original"  "$out"
-    assert_output "shows replaced lines"    "Replaced"  "$out"
+    assert_output "shows original lines"    "Before"  "$out"
+    assert_output "shows replaced lines"    "After"   "$out"
     assert_output "shows replacement text"  "RESOLVED"  "$out"
 }
 
@@ -1072,6 +1072,112 @@ sys.stdout.buffer.write('\n'.join(lines).encode('utf-8') + b'\n')
 }
 
 
+# ================= ENCODING PRESERVATION TEST =================
+test_encoding_preservation() {
+    setup_test_case "31_encoding_preservation"
+    section "Encoding Preservation (ISO-8859-1 / non-UTF-8)"
+
+    local ISO_FILE="$CURRENT_TEST_DIR/iso_data.txt"
+    local ORIG_BIN="$CURRENT_TEST_DIR/iso_original.bin"
+
+    # Write ISO-8859-1 bytes directly via Python (avoids shell encoding issues).
+    # \xe9 = é in ISO-8859-1, \xef = ï in ISO-8859-1
+    python3 -c "
+import sys
+lines = [
+    b'1-HEADER|DATE=2026-01-30|SRC=UNITTEST\n',
+    b'2:00002caf\xe9-ITEM|CAT=A|AMT=00001.00|FLAG=Y\n',
+    b'3:00003na\xefve-ITEM|CAT=B|AMT=00002.00|FLAG=N\n',
+    b'4:00004plain-ITEM|CAT=C|AMT=00003.00|FLAG=Y\n',
+    b'FOOTERTEST00000003\n',
+]
+open(sys.argv[1], 'wb').write(b''.join(lines))
+" "$ISO_FILE"
+    # Save a pristine copy for byte-exact rollback comparison
+    cp "$ISO_FILE" "$ORIG_BIN"
+    local orig_size
+    orig_size=$(stat -c%s "$ISO_FILE" 2>/dev/null || stat -f%z "$ISO_FILE" 2>/dev/null)
+
+    # -- 1: file info detects non-UTF-8 encoding --------------------------------
+    local info_out
+    info_out=$(run_cmd -f "$ISO_FILE" -l 2 --dry-run --yes --no-color 2>&1 || true)
+    if echo "$info_out" | grep -qiE "(ISO|latin|8859|CP125)"; then
+        ok "encoding detection: non-UTF-8 encoding reported in file info"
+    else
+        fail "encoding detection: expected ISO/latin/8859 in Type field (got: $(echo "$info_out" | grep -i type))"
+    fi
+
+    # -- 2: UTF-8 search term triggers conversion warning ----------------------
+    local search_out
+    search_out=$(run_cmd -f "$ISO_FILE" -w "café" --dry-run --yes --no-color 2>&1 || true)
+    if echo "$search_out" | grep -qi "converted\|ISO\|encoding"; then
+        ok "encoding warning: conversion notice shown on mismatch"
+    else
+        fail "encoding warning: expected conversion notice for UTF-8 search on ISO file"
+    fi
+    if echo "$search_out" | grep -qiE "caf|match"; then
+        ok "encoding search: UTF-8 term finds match in ISO-8859-1 file"
+    else
+        fail "encoding search: UTF-8 café did not find match in ISO-8859-1 file"
+    fi
+
+    # -- 3: -l delete — ISO bytes preserved in remaining lines ----------------
+    run_cmd -f "$ISO_FILE" -l 4 --yes --no-color >/dev/null 2>&1
+    if python3 -c "
+d=open('$ISO_FILE','rb').read()
+assert b'\xe9' in d, 'xe9 byte lost'
+assert b'\xef' in d, 'xef byte lost'
+"; then
+        ok "after -l delete: ISO-8859-1 bytes preserved in remaining lines"
+    else
+        fail "after -l delete: non-ASCII bytes corrupted"
+    fi
+
+    # -- 4: -w delete — byte check on surviving lines -------------------------
+    cp "$ORIG_BIN" "$ISO_FILE" && rm -f "${ISO_FILE}_backup"
+    run_cmd -f "$ISO_FILE" -w "plain" --yes --no-color >/dev/null 2>&1
+    if python3 -c "
+d=open('$ISO_FILE','rb').read()
+assert b'\xe9' in d, 'xe9 lost after kw delete'
+assert b'\xef' in d, 'xef lost after kw delete'
+assert b'plain' not in d, 'plain line not deleted'
+"; then
+        ok "after -w delete: ISO bytes preserved, target removed"
+    else
+        fail "after -w delete: bytes corrupted or target not removed"
+    fi
+
+    # -- 5: replace — ISO bytes preserved, ASCII replacement written -----------
+    cp "$ORIG_BIN" "$ISO_FILE" && rm -f "${ISO_FILE}_backup"
+    run_cmd -f "$ISO_FILE" -w "plain" --replace-pos 1-5 --replace-txt "FIXED"         --yes --no-color >/dev/null 2>&1
+    if python3 -c "
+d=open('$ISO_FILE','rb').read()
+assert b'\xe9' in d, 'xe9 lost after replace'
+assert b'\xef' in d, 'xef lost after replace'
+assert b'FIXED' in d, 'replacement not applied'
+"; then
+        ok "after replace: ISO bytes preserved, replacement applied"
+    else
+        fail "after replace: bytes corrupted or replacement not applied"
+    fi
+
+    # -- 6: rollback restores byte-exact original ------------------------------
+    # Backup was created by the replace above
+    run_cmd -f "$ISO_FILE" --rollback --yes --no-color >/dev/null 2>&1
+    if diff -q "$ISO_FILE" "$ORIG_BIN" >/dev/null 2>&1; then
+        ok "after rollback: file is byte-exact match of original"
+    else
+        fail "after rollback: file differs from original (encoding corrupted?)"
+    fi
+    local post_size
+    post_size=$(stat -c%s "$ISO_FILE" 2>/dev/null || stat -f%z "$ISO_FILE" 2>/dev/null)
+    if (( post_size == orig_size )); then
+        ok "after rollback: byte size matches original ($orig_size bytes)"
+    else
+        fail "after rollback: byte size mismatch — expected $orig_size, got $post_size"
+    fi
+}
+
 # ================= LARGE FILE STRESS TEST =================
 # Target: ~10 GB file, 500+ char lines, low variant density.
 # NOT run in the default suite -- requires explicit opt-in:
@@ -1586,6 +1692,9 @@ main() {
 
     # UTF-8
     run_test test_utf8
+
+    # Encoding preservation
+    run_test test_encoding_preservation
 
     # Large file stress test (opt-in: RUN_LARGE_FILE_TEST=1)
     run_test test_large_file

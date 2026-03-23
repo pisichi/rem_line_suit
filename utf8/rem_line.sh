@@ -371,8 +371,15 @@ preview_replacements() {
             shown++
             if (shown <= limit) {
                 new_line = substr($0,1,rs-1) rtxt substr($0,re+1)
-                if (nc) { print "Original " NR ": " $0; print "Replaced " NR ": " new_line; print "" }
-                else    { print Y"Original "NR":"X" "R $0 X; print Y"Replaced "NR":"X" "G new_line X; print "" }
+                if (nc) {
+                    printf "  Before %5d | %s\n", NR, $0
+                    printf "  After  %5d | %s\n", NR, new_line
+                    print ""
+                } else {
+                    printf "  %sBefore%s %s%5d |%s %s\n", Y, X, Y, NR, X, $0
+                    printf "  %sAfter %s %s%5d |%s %s%s%s\n", Y, X, G, NR, X, G, new_line, X
+                    print ""
+                }
             }
             if (shown > limit) { print "... +" (shown-limit) " more"; exit }
         }
@@ -640,18 +647,18 @@ keyword_search() {
                 exit 2
             }
             if (shown <= limit) {
-                if (nc) { print NR":"$0 }
+                if (nc) { printf "%5d | %s\n", NR, $0 }
                 else {
                     if (s && e) {
                         bef=substr($0,1,s-1); seg2=substr($0,s,e-s+1); aft=substr($0,e+1)
                         if (regex) gsub(w, R"&"X, seg2)
                         else { esc=w; gsub(/[[\\.^$*+?{}()|]/,"\\\\&",esc); gsub(esc,R w X,seg2) }
-                        print NR":"bef seg2 aft
+                        printf "%s%5d |%s %s%s%s\n", Y, NR, X, bef, seg2, aft
                     } else {
                         line=$0
                         if (regex) gsub(w, R"&"X, line)
                         else { esc=w; gsub(/[[\\.^$*+?{}()|]/,"\\\\&",esc); gsub(esc,R w X,line) }
-                        print NR":"line
+                        printf "%s%5d |%s %s\n", Y, NR, X, line
                     }
                 }
             }
