@@ -81,12 +81,12 @@ setup_test_case() {
 
 # ================= HELPERS =================
 ok() {
-    echo -e "  ${GREEN}[PASS]${RESET} $1"
+    echo -e "  ${GREEN}[PASS] [PASS]${RESET} $1"
     ((PASS+=1)) || true
 }
 
 fail() {
-    echo -e "  ${RED}[FAIL]${RESET} $1"
+    echo -e "  ${RED}[FAIL] [FAIL]${RESET} $1"
     ((FAIL+=1)) || true
 }
 
@@ -560,6 +560,25 @@ test_rollback_without_backup() {
     else
         fail "rollback should fail without backup"
     fi
+
+    # Tampered backup: create a backup that is smaller than the current file
+    # (simulates someone editing/truncating the backup manually).
+    # Rollback must refuse — a smaller backup cannot be a valid restore point.
+    run_cmd -f "$FILE" -l 50 --yes --no-color >/dev/null 2>&1
+    backup_path=$(get_backup_path "$FILE")
+    # Truncate the backup to 10 bytes (clearly smaller than the ~5KB data file)
+    dd if="$backup_path" bs=10 count=1 of="${backup_path}.small" 2>/dev/null         && mv "${backup_path}.small" "$backup_path"
+    local tamper_out
+    tamper_out=$(run_cmd -f "$FILE" --rollback --yes --no-color)
+    if echo "$tamper_out" | grep -qiE "(smaller|corrupt|backup|aborting|Error|invalid|found)"; then
+        ok "rollback rejects backup smaller than current file"
+    else
+        fail "rollback should reject truncated/tampered backup"
+    fi
+    # File must be unchanged after rejected rollback
+    local after_lines
+    after_lines=$(count_lines "$FILE")
+    assert "file unchanged after rejected rollback" test "$after_lines" -eq 101
 }
 
 # ================= REGEX TESTS =================

@@ -313,6 +313,17 @@ rollback_file() {
     backup=$(get_backup_name "$file")
     [[ -f "$backup" ]] || err "Backup file not found: $backup"
     (( ! NO_HEADER_FOOTER )) && validate_footer "$backup" > /dev/null
+
+    # Size sanity: backup must be >= current file.
+    # Current file is smaller after deletions — that is normal.
+    # A backup smaller than the current file means it was truncated or tampered.
+    local backup_size file_size
+    backup_size=$(stat -c%s "$backup" 2>/dev/null || stat -f%z "$backup" 2>/dev/null || echo 0)
+    file_size=$(  stat -c%s "$file"   2>/dev/null || stat -f%z "$file"   2>/dev/null || echo 0)
+    if (( backup_size < file_size )); then
+        err "Backup is smaller than current file (backup: ${backup_size}B, current: ${file_size}B). Backup may be corrupt. Aborting rollback."
+    fi
+
     info "Current file size: $(du -h "$file"  | cut -f1)"
     info "Backup file size:  $(du -h "$backup" | cut -f1)"
     (( DRY_RUN )) && { info "[DRY-RUN] Would restore from: $backup"; return; }
